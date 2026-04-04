@@ -1,0 +1,11 @@
+build/
+.vs/
+.vscode/*.log
+data/processed/
+*.exe
+*.ilk
+*.obj
+*.pdb
+*.log
+.clangd
+compile_commands.json
