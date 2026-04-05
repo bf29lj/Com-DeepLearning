@@ -78,12 +78,14 @@ constexpr const char *MATH_KERNEL_SOURCE = R"CLC(
         __global const float *prediction,
         __global const float *target,
         __global float *losses,
-        const float epsilon)
+        const float epsilon,
+        const float positive_weight,
+        const float negative_weight)
     {
         const uint idx = get_global_id(0);
         const float p = clamp(prediction[idx], epsilon, 1.0f - epsilon);
         const float y = target[idx];
-        losses[idx] = -(y * log(p) + (1.0f - y) * log(1.0f - p));
+        losses[idx] = -(positive_weight * y * log(p) + negative_weight * (1.0f - y) * log(1.0f - p));
     }
 
     __kernel void bce_loss_derivative(
@@ -91,12 +93,55 @@ constexpr const char *MATH_KERNEL_SOURCE = R"CLC(
         __global const float *target,
         __global float *grad,
         const float epsilon,
-        const float inv_n)
+        const float inv_n,
+        const float positive_weight,
+        const float negative_weight)
     {
         const uint idx = get_global_id(0);
         const float p = clamp(prediction[idx], epsilon, 1.0f - epsilon);
         const float y = target[idx];
-        grad[idx] = ((p - y) / (p * (1.0f - p))) * inv_n;
+        grad[idx] = (-(positive_weight * y / p) + (negative_weight * (1.0f - y) / (1.0f - p))) * inv_n;
+    }
+
+    __kernel void elementwise_multiply_inplace(
+        __global float *values,
+        __global const float *factors)
+    {
+        const uint idx = get_global_id(0);
+        values[idx] *= factors[idx];
+    }
+
+    __kernel void dense_backward_input(
+        __global const float *weights,
+        __global const float *grad_output,
+        __global float *grad_input,
+        const uint input_size,
+        const uint output_size)
+    {
+        const uint in = get_global_id(0);
+        float sum = 0.0f;
+        for (uint out = 0; out < output_size; ++out) {
+            sum += weights[out * input_size + in] * grad_output[out];
+        }
+        grad_input[in] = sum;
+    }
+
+    __kernel void dense_sgd_update(
+        __global float *weights,
+        __global float *biases,
+        __global const float *input,
+        __global const float *grad_output,
+        const float learning_rate,
+        const uint input_size)
+    {
+        const uint out = get_global_id(0);
+        const float delta = grad_output[out];
+        biases[out] -= learning_rate * delta;
+
+        const uint offset = out * input_size;
+        for (uint in = 0; in < input_size; ++in) {
+            weights[offset + in] -= learning_rate * delta * input[in];
+        }
     }
 )CLC";
 

@@ -5,6 +5,7 @@
 #include "defect_dataset.h"
 
 #include <cstddef>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -22,6 +23,10 @@ enum class LossType {
 enum class ExecutionBackend {
     CPU,
     GPU,
+};
+
+enum class OptimizerType {
+    SGD,
 };
 
 // 1D operation kinds in a configurable forward pipeline.
@@ -69,6 +74,15 @@ public:
     void set_execution_backend(ExecutionBackend backend) { execution_backend_ = backend; }
     ExecutionBackend execution_backend() const { return execution_backend_; }
 
+    // Sets optimizer behavior used by training backprop/update path.
+    void set_optimizer_type(OptimizerType optimizer_type) { optimizer_type_ = optimizer_type; }
+    OptimizerType optimizer_type() const { return optimizer_type_; }
+    void set_enable_bce_sigmoid_shortcut(bool enable) { enable_bce_sigmoid_shortcut_ = enable; }
+    bool enable_bce_sigmoid_shortcut() const { return enable_bce_sigmoid_shortcut_; }
+    void set_class_weights(float positive_weight, float negative_weight);
+    float positive_class_weight() const { return positive_class_weight_; }
+    float negative_class_weight() const { return negative_class_weight_; }
+
     // Runs a single 1D forward pass using selected backend.
     std::vector<float> forward(const std::vector<float> &input);
     std::vector<float> forward_cpu(const std::vector<float> &input) const;
@@ -96,6 +110,12 @@ public:
     // Returns the configured operation pipeline.
     const std::vector<OperationConfig> &operations() const { return operations_; }
 
+    // Persists model structure and parameters to disk.
+    void save_to_file(const std::filesystem::path &model_path) const;
+
+    // Loads model parameters from disk and syncs to the selected backend.
+    void load_from_file(const std::filesystem::path &model_path);
+
 private:
     struct ForwardCache {
         std::vector<std::vector<float>> op_inputs;
@@ -115,12 +135,29 @@ private:
                    GpuContext &ctx);
     };
 
+    struct SgdOptimizer {
+        static float output_gradient(float prediction,
+                                     float target,
+                                     LossType loss_type,
+                                     bool use_bce_sigmoid_shortcut,
+                                     float positive_weight,
+                                     float negative_weight,
+                                     float (*loss_derivative_wrt_prediction)(float, float, LossType, float, float));
+        static void update_dense_layer_cpu(DenseLayer &layer,
+                                           const std::vector<float> &input,
+                                           const std::vector<float> &grad_output,
+                                           std::vector<float> &grad_input,
+                                           float learning_rate);
+    };
+
     static GpuProgram create_kernels(GpuContext &ctx);
     static std::vector<OperationConfig> build_operations_from_layer_sizes(
         const std::vector<std::size_t> &layer_sizes);
     void initialize_layer(DenseLayer &layer);
     void sync_layer_to_device_gpu(DenseLayer &layer);
     void sync_all_layers_to_device_gpu();
+    void sync_layer_to_host_gpu(DenseLayer &layer);
+    void sync_all_layers_to_host_gpu();
     void run_dense_layer_gpu(DenseLayer &layer, GpuBuffer &input, GpuBuffer &output);
     void apply_activation_gpu(ActivationType type, GpuBuffer &values);
     std::vector<float> forward_internal_gpu(const std::vector<float> &input,
@@ -137,9 +174,22 @@ private:
                              float target,
                              float learning_rate,
                              LossType loss_type);
-    static float compute_loss(float prediction, float target, LossType loss_type);
-    static float loss_derivative_wrt_prediction(float prediction, float target, LossType loss_type);
+    void backward_update_gpu(const ForwardCache &cache,
+                             float target,
+                             float learning_rate,
+                             LossType loss_type);
+    static float compute_loss(float prediction,
+                              float target,
+                              LossType loss_type,
+                              float positive_weight,
+                              float negative_weight);
+    static float loss_derivative_wrt_prediction(float prediction,
+                                                float target,
+                                                LossType loss_type,
+                                                float positive_weight,
+                                                float negative_weight);
     static float activation_derivative(OperationType op_type, float pre_activation, float post_activation);
+    bool should_use_bce_sigmoid_shortcut(LossType loss_type) const;
     static ActivationType operation_to_activation(OperationType op_type);
 
     GpuContext &context_;
@@ -147,4 +197,8 @@ private:
     std::vector<OperationConfig> operations_;
     std::vector<DenseLayer> layers_;
     ExecutionBackend execution_backend_ = ExecutionBackend::GPU;
+    OptimizerType optimizer_type_ = OptimizerType::SGD;
+    bool enable_bce_sigmoid_shortcut_ = true;
+    float positive_class_weight_ = 1.0f;
+    float negative_class_weight_ = 1.0f;
 };
