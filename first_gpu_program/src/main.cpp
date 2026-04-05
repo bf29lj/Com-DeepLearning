@@ -30,6 +30,7 @@ std::filesystem::path resolve_dataset_path() {
 int main() {
     try {
         const LossType selected_loss = LossType::BCE;
+        const ExecutionBackend selected_backend = ExecutionBackend::GPU;
         const float learning_rate = 0.01f;
 
         GpuContext ctx = GpuContext::create_default();
@@ -49,6 +50,7 @@ int main() {
             OperationConfig::sigmoid(),
         };
         MlpNetwork network(ctx, std::move(operations));
+        network.set_execution_backend(selected_backend);
 
         const DefectSample &first_sample = dataset.sample(0);
         std::vector<float> input = first_sample.features;
@@ -84,6 +86,8 @@ int main() {
         const auto cost_duration = std::chrono::duration_cast<std::chrono::milliseconds>(cost_end - cost_start);
 
         std::cout << "Loss function: " << (selected_loss == LossType::BCE ? "BCE" : "MSE") << "\n";
+        std::cout << "Execution backend: "
+              << (selected_backend == ExecutionBackend::GPU ? "GPU" : "CPU") << "\n";
         std::cout << "Learning rate: " << learning_rate << "\n";
         std::cout << "Cost before training: " << before_cost << "\n";
         std::cout << "Average epoch training cost: " << train_epoch_cost << "\n";
