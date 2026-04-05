@@ -1,0 +1,60 @@
+{
+  "label_column": "DefectStatus",
+  "dropped_columns": [
+    "DefectRate",
+    "QualityScore"
+  ],
+  "feature_columns": [
+    "ProductionVolume",
+    "ProductionCost",
+    "SupplierQuality",
+    "DeliveryDelay",
+    "MaintenanceHours",
+    "DowntimePercentage",
+    "InventoryTurnover",
+    "StockoutRate",
+    "WorkerProductivity",
+    "SafetyIncidents",
+    "EnergyConsumption",
+    "EnergyEfficiency",
+    "AdditiveProcessTime",
+    "AdditiveMaterialCost"
+  ],
+  "means": {
+    "ProductionVolume": 550.0731922398589,
+    "ProductionCost": 12360.069582898128,
+    "SupplierQuality": 89.81440628183518,
+    "DeliveryDelay": 2.5326278659611994,
+    "MaintenanceHours": 11.47883597883598,
+    "DowntimePercentage": 2.5125910148684194,
+    "InventoryTurnover": 6.011661574803286,
+    "StockoutRate": 0.051153591110188565,
+    "WorkerProductivity": 90.0587205050651,
+    "SafetyIncidents": 4.5736331569664905,
+    "EnergyConsumption": 2998.1855988824423,
+    "EnergyEfficiency": 0.29930351724819837,
+    "AdditiveProcessTime": 5.480927743355321,
+    "AdditiveMaterialCost": 299.39171515886824
+  },
+  "stds": {
+    "ProductionVolume": 260.22057684039896,
+    "ProductionCost": 4317.293358912577,
+    "SupplierQuality": 5.67950353234229,
+    "DeliveryDelay": 1.7023411540364446,
+    "MaintenanceHours": 6.884534726337078,
+    "DowntimePercentage": 1.4462991654935884,
+    "InventoryTurnover": 2.3373973004278663,
+    "StockoutRate": 0.02904155638329845,
+    "WorkerProductivity": 5.715243940802053,
+    "SafetyIncidents": 2.911140135471647,
+    "EnergyConsumption": 1153.0291424387885,
+    "EnergyEfficiency": 0.11609487745288892,
+    "AdditiveProcessTime": 2.5985247113313914,
+    "AdditiveMaterialCost": 117.07658134689795
+  },
+  "splits": {
+    "train": 2268,
+    "val": 486,
+    "test": 486
+  }
+}
