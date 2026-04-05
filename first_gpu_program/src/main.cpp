@@ -384,9 +384,11 @@ int main(int argc, char **argv) {
         std::vector<OperationConfig> operations = {
             OperationConfig::linear(dataset.feature_count(), 14),
             OperationConfig::relu(),
-            OperationConfig::linear(14, 14),
+            OperationConfig::linear(14, 10),
             OperationConfig::relu(),
-            OperationConfig::linear(14, 1),
+            OperationConfig::linear(10, 8),
+            OperationConfig::relu(),
+            OperationConfig::linear(8, 1),
             OperationConfig::sigmoid(),
         };
         MlpNetwork network(ctx, std::move(operations));

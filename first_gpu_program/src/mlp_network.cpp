@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <fstream>
+#include <limits>
 #include <random>
 #include <stdexcept>
 
@@ -86,13 +87,23 @@ MlpNetwork::MlpNetwork(GpuContext &ctx, std::vector<OperationConfig> operations)
     }
 
     operations_ = std::move(operations);
-    for (const auto &op : operations_) {
+    for (std::size_t i = 0; i < operations_.size(); ++i) {
+        const auto &op = operations_[i];
         if (op.type == OperationType::Linear) {
             if (op.input_size == 0 || op.output_size == 0) {
                 throw std::invalid_argument("Linear operation requires non-zero input_size and output_size");
             }
-            layers_.emplace_back(op.input_size, op.output_size, ActivationType::Linear, context_);
-            initialize_layer(layers_.back());
+            OperationType next_op_type = OperationType::Linear;
+            if (i + 1 < operations_.size()) {
+                next_op_type = operations_[i + 1].type;
+            }
+
+            layers_.emplace_back(
+                op.input_size,
+                op.output_size,
+                operation_to_activation(next_op_type),
+                context_);
+            initialize_layer(layers_.back(), next_op_type);
         }
     }
 }
@@ -117,12 +128,29 @@ std::vector<OperationConfig> MlpNetwork::build_operations_from_layer_sizes(
     return operations;
 }
 
-void MlpNetwork::initialize_layer(DenseLayer &layer) {
+void MlpNetwork::initialize_layer(DenseLayer &layer, OperationType next_op_type) {
     std::mt19937 gen(42u + static_cast<unsigned int>(layer.input_size * 31 + layer.output_size));
-    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+
+    const float fan_in = static_cast<float>(layer.input_size);
+    const float fan_out = static_cast<float>(layer.output_size);
+
+    float stddev = 0.0f;
+    if (next_op_type == OperationType::Relu) {
+        // He initialization keeps variance stable through ReLU units.
+        stddev = std::sqrt(2.0f / fan_in);
+    } else {
+        // Xavier/Glorot initialization is a good default for sigmoid/linear outputs.
+        stddev = std::sqrt(2.0f / (fan_in + fan_out));
+    }
+
+    if (!std::isfinite(stddev) || stddev <= std::numeric_limits<float>::min()) {
+        throw std::runtime_error("Invalid stddev in weight initialization");
+    }
+
+    std::normal_distribution<float> dist(0.0f, stddev);
 
     for (float &w : layer.host_weights) {
-        w = dist(gen) * 0.2f;
+        w = dist(gen);
     }
 
     std::fill(layer.host_biases.begin(), layer.host_biases.end(), 0.0f);

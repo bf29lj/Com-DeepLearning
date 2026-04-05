@@ -153,7 +153,7 @@ private:
     static GpuProgram create_kernels(GpuContext &ctx);
     static std::vector<OperationConfig> build_operations_from_layer_sizes(
         const std::vector<std::size_t> &layer_sizes);
-    void initialize_layer(DenseLayer &layer);
+    void initialize_layer(DenseLayer &layer, OperationType next_op_type);
     void sync_layer_to_device_gpu(DenseLayer &layer);
     void sync_all_layers_to_device_gpu();
     void sync_layer_to_host_gpu(DenseLayer &layer);
