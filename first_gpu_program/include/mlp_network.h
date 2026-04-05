@@ -91,13 +91,16 @@ public:
     // Trains one epoch using selected backend and returns average epoch loss.
     float train_one_epoch(const ManufacturingDefectDataset &dataset,
                           float learning_rate,
-                          LossType loss_type);
+                          LossType loss_type,
+                          std::size_t batch_size = 1);
     float train_one_epoch_cpu(const ManufacturingDefectDataset &dataset,
                               float learning_rate,
-                              LossType loss_type);
+                              LossType loss_type,
+                              std::size_t batch_size = 1);
     float train_one_epoch_gpu(const ManufacturingDefectDataset &dataset,
                               float learning_rate,
-                              LossType loss_type);
+                              LossType loss_type,
+                              std::size_t batch_size = 1);
 
     // Evaluates average loss over a dataset using selected backend.
     float evaluate_cost(const ManufacturingDefectDataset &dataset,
@@ -169,7 +172,8 @@ private:
     float train_one_epoch_internal(const ManufacturingDefectDataset &dataset,
                                    float learning_rate,
                                    LossType loss_type,
-                                   ExecutionBackend backend);
+                                   ExecutionBackend backend,
+                                   std::size_t batch_size);
     void backward_update_cpu(const ForwardCache &cache,
                              float target,
                              float learning_rate,

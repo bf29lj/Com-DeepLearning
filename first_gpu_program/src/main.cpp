@@ -22,6 +22,9 @@ struct TrainingConfig {
     ExecutionBackend backend = ExecutionBackend::GPU;
     LossType loss = LossType::BCE;
     float learning_rate = 0.01f;
+    float lr_decay = 1.0f;
+    std::size_t lr_decay_every = 1;
+    float min_learning_rate = 0.0f;
     std::filesystem::path results_csv_path;
     std::filesystem::path pr_csv_path;
     float positive_class_weight = 1.0f;
@@ -30,6 +33,7 @@ struct TrainingConfig {
     float pr_scan_min = 0.0f;
     float pr_scan_max = 1.0f;
     float pr_scan_step = 0.02f;
+    std::size_t batch_size = 1;
     std::size_t epochs = 20;
     std::size_t print_every = 1;
     bool eval_only = false;
@@ -59,10 +63,14 @@ void print_usage() {
               << "  --pr-csv <path>      Write threshold scan for PR curve to CSV\n"
               << "  --loss <bce|mse>     Loss function (default: bce)\n"
               << "  --lr <float>         Learning rate (default: 0.01)\n"
+              << "  --lr-decay <float>   Multiplicative LR decay factor (default: 1.0)\n"
+              << "  --lr-decay-every <int> Apply LR decay every N epochs (default: 1)\n"
+              << "  --min-lr <float>     Lower bound for decayed LR (default: 0.0)\n"
               << "  --pos-weight <float> Positive class weight for BCE (default: 1.0)\n"
               << "  --neg-weight <float> Negative class weight for BCE (default: 1.0)\n"
               << "  --auto-class-weights Auto-compute BCE class weights from dataset\n"
               << "  --threshold <float>  Classification threshold [0,1] (default: 0.5)\n"
+              << "  --batch-size <int>   Batch size for training updates (default: 1)\n"
               << "  --epochs <int>       Number of training epochs (default: 20)\n"
               << "  --print-every <int>  Epoch log interval (default: 1)\n"
               << "  --eval-only          Skip training and only run evaluation\n"
@@ -118,6 +126,16 @@ TrainingConfig parse_args(int argc, char **argv) {
             cfg.loss = parse_loss(need_value(arg));
         } else if (arg == "--lr") {
             cfg.learning_rate = std::stof(need_value(arg));
+        } else if (arg == "--lr-decay") {
+            cfg.lr_decay = std::stof(need_value(arg));
+        } else if (arg == "--lr-decay-every") {
+            const int decay_every = std::stoi(need_value(arg));
+            if (decay_every <= 0) {
+                throw std::invalid_argument("--lr-decay-every must be positive");
+            }
+            cfg.lr_decay_every = static_cast<std::size_t>(decay_every);
+        } else if (arg == "--min-lr") {
+            cfg.min_learning_rate = std::stof(need_value(arg));
         } else if (arg == "--pr-csv") {
             cfg.pr_csv_path = need_value(arg);
         } else if (arg == "--pos-weight") {
@@ -134,6 +152,12 @@ TrainingConfig parse_args(int argc, char **argv) {
             cfg.pr_scan_max = std::stof(need_value(arg));
         } else if (arg == "--pr-step") {
             cfg.pr_scan_step = std::stof(need_value(arg));
+        } else if (arg == "--batch-size") {
+            const int batch_size = std::stoi(need_value(arg));
+            if (batch_size <= 0) {
+                throw std::invalid_argument("--batch-size must be positive");
+            }
+            cfg.batch_size = static_cast<std::size_t>(batch_size);
         } else if (arg == "--epochs") {
             const int epochs = std::stoi(need_value(arg));
             if (epochs <= 0) {
@@ -159,6 +183,15 @@ TrainingConfig parse_args(int argc, char **argv) {
 
     if (cfg.learning_rate <= 0.0f || !std::isfinite(cfg.learning_rate)) {
         throw std::invalid_argument("--lr must be a positive finite number");
+    }
+    if (cfg.lr_decay <= 0.0f || cfg.lr_decay > 1.0f || !std::isfinite(cfg.lr_decay)) {
+        throw std::invalid_argument("--lr-decay must be in (0, 1]");
+    }
+    if (cfg.min_learning_rate < 0.0f || !std::isfinite(cfg.min_learning_rate)) {
+        throw std::invalid_argument("--min-lr must be a non-negative finite number");
+    }
+    if (cfg.min_learning_rate > cfg.learning_rate) {
+        throw std::invalid_argument("--min-lr must be <= --lr");
     }
     if (cfg.positive_class_weight <= 0.0f || !std::isfinite(cfg.positive_class_weight)) {
         throw std::invalid_argument("--pos-weight must be a positive finite number");
@@ -410,8 +443,12 @@ int main(int argc, char **argv) {
         std::cout << "Loss function: " << loss_name(config.loss) << "\n";
         std::cout << "Execution backend: " << backend_name(config.backend) << "\n";
         std::cout << "Learning rate: " << config.learning_rate << "\n";
+        std::cout << "LR decay: " << config.lr_decay
+              << " every " << config.lr_decay_every
+              << " epoch(s), min_lr=" << config.min_learning_rate << "\n";
         std::cout << "Auto class weights: " << (config.auto_class_weights ? "true" : "false") << "\n";
         std::cout << "Threshold: " << config.threshold << "\n";
+        std::cout << "Batch size: " << config.batch_size << "\n";
         std::cout << "Epochs: " << config.epochs << "\n";
         std::cout << "Print every: " << config.print_every << "\n";
         std::cout << "Eval only: " << (config.eval_only ? "true" : "false") << "\n";
@@ -438,7 +475,20 @@ int main(int argc, char **argv) {
         if (!config.eval_only) {
             for (std::size_t epoch = 1; epoch <= config.epochs; ++epoch) {
                 const auto epoch_start = std::chrono::high_resolution_clock::now();
-                const float epoch_train_loss = network.train_one_epoch(dataset, config.learning_rate, config.loss);
+                const std::size_t decay_steps = (epoch - 1) / config.lr_decay_every;
+                float current_lr = config.learning_rate;
+                if (config.lr_decay < 1.0f && decay_steps > 0) {
+                    current_lr *= std::pow(config.lr_decay, static_cast<float>(decay_steps));
+                }
+                if (current_lr < config.min_learning_rate) {
+                    current_lr = config.min_learning_rate;
+                }
+
+                const float epoch_train_loss = network.train_one_epoch(
+                    dataset,
+                    current_lr,
+                    config.loss,
+                    config.batch_size);
                 const auto epoch_end = std::chrono::high_resolution_clock::now();
                 const auto epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(epoch_end - epoch_start);
                 accumulated_train_loss += epoch_train_loss;
@@ -453,6 +503,7 @@ int main(int argc, char **argv) {
 
                     std::cout << "[Epoch " << epoch << "/" << config.epochs << "] "
                               << "train_loss=" << epoch_train_loss
+                              << ", lr=" << current_lr
                               << ", eval_cost=" << last_eval_cost
                               << ", train_time=" << epoch_ms.count() << " ms"
                               << ", eval_time=" << eval_ms.count() << " ms\n";

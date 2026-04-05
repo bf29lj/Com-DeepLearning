@@ -4,6 +4,7 @@
 #include <cmath>
 #include <fstream>
 #include <limits>
+#include <numeric>
 #include <random>
 #include <stdexcept>
 
@@ -660,7 +661,8 @@ float MlpNetwork::evaluate_cost(const ManufacturingDefectDataset &dataset, LossT
 float MlpNetwork::train_one_epoch_internal(const ManufacturingDefectDataset &dataset,
                                            float learning_rate,
                                            LossType loss_type,
-                                           ExecutionBackend backend)
+                                           ExecutionBackend backend,
+                                           std::size_t batch_size)
 {
     if (dataset.size() == 0) {
         throw std::invalid_argument("Dataset is empty");
@@ -668,22 +670,146 @@ float MlpNetwork::train_one_epoch_internal(const ManufacturingDefectDataset &dat
     if (learning_rate <= 0.0f) {
         throw std::invalid_argument("Learning rate must be positive");
     }
+    if (batch_size == 0) {
+        throw std::invalid_argument("Batch size must be positive");
+    }
 
     float total_loss = 0.0f;
+    const bool use_bce_sigmoid_shortcut = should_use_bce_sigmoid_shortcut(loss_type);
 
-    for (const auto &sample : dataset.samples()) {
-        const ForwardCache cache = forward_with_cache_for_backend(sample.features, backend);
-        const std::vector<float> &current = cache.op_outputs.back();
-        const float target = static_cast<float>(sample.label);
-        if (current.empty()) {
-            throw std::runtime_error("Network output is empty");
+    struct LayerGradients {
+        std::vector<float> d_weights;
+        std::vector<float> d_biases;
+    };
+
+    std::vector<LayerGradients> batch_grads;
+    batch_grads.reserve(layers_.size());
+    for (const DenseLayer &layer : layers_) {
+        batch_grads.push_back({
+            std::vector<float>(layer.host_weights.size(), 0.0f),
+            std::vector<float>(layer.host_biases.size(), 0.0f),
+        });
+    }
+
+    auto clear_batch_grads = [&batch_grads]() {
+        for (LayerGradients &g : batch_grads) {
+            std::fill(g.d_weights.begin(), g.d_weights.end(), 0.0f);
+            std::fill(g.d_biases.begin(), g.d_biases.end(), 0.0f);
+        }
+    };
+
+    auto accumulate_sample_gradients = [&](const ForwardCache &cache, float target) {
+        if (cache.op_outputs.empty()) {
+            throw std::runtime_error("Forward cache is empty");
         }
 
-        total_loss += compute_loss(current[0], target, loss_type, positive_class_weight_, negative_class_weight_);
-        if (backend == ExecutionBackend::CPU) {
-            backward_update_cpu(cache, target, learning_rate, loss_type);
-        } else {
-            backward_update_gpu(cache, target, learning_rate, loss_type);
+        const std::vector<float> &network_output = cache.op_outputs.back();
+        if (network_output.size() != 1) {
+            throw std::runtime_error("Current training path expects a single output unit");
+        }
+
+        std::vector<float> gradient(network_output.size(), 0.0f);
+        gradient[0] = SgdOptimizer::output_gradient(
+            network_output[0],
+            target,
+            loss_type,
+            use_bce_sigmoid_shortcut,
+            positive_class_weight_,
+            negative_class_weight_,
+            loss_derivative_wrt_prediction);
+
+        std::size_t reverse_linear_index = layers_.size();
+
+        for (std::size_t op_index = operations_.size(); op_index-- > 0;) {
+            const OperationType op_type = operations_[op_index].type;
+            const std::vector<float> &op_input = cache.op_inputs[op_index];
+            const std::vector<float> &op_output = cache.op_outputs[op_index];
+
+            if (op_type == OperationType::Relu || op_type == OperationType::Sigmoid) {
+                const bool skip_output_sigmoid_derivative =
+                    use_bce_sigmoid_shortcut &&
+                    op_type == OperationType::Sigmoid &&
+                    op_index + 1 == operations_.size();
+                if (skip_output_sigmoid_derivative) {
+                    continue;
+                }
+
+                if (gradient.size() != op_output.size()) {
+                    throw std::runtime_error("Gradient size mismatch in activation backward pass");
+                }
+
+                for (std::size_t i = 0; i < gradient.size(); ++i) {
+                    const float local_derivative = activation_derivative(op_type, op_input[i], op_output[i]);
+                    gradient[i] *= local_derivative;
+                }
+                continue;
+            }
+
+            if (reverse_linear_index == 0) {
+                throw std::runtime_error("Internal linear layer reverse index out of range");
+            }
+
+            DenseLayer &layer = layers_[--reverse_linear_index];
+            LayerGradients &layer_grad = batch_grads[reverse_linear_index];
+            if (gradient.size() != layer.output_size || op_input.size() != layer.input_size) {
+                throw std::runtime_error("Gradient/input size mismatch in linear backward pass");
+            }
+
+            std::vector<float> input_gradient(layer.input_size, 0.0f);
+            for (std::size_t out = 0; out < layer.output_size; ++out) {
+                const float delta = gradient[out];
+                layer_grad.d_biases[out] += delta;
+
+                for (std::size_t in = 0; in < layer.input_size; ++in) {
+                    const std::size_t weight_index = out * layer.input_size + in;
+                    layer_grad.d_weights[weight_index] += delta * op_input[in];
+                    input_gradient[in] += layer.host_weights[weight_index] * delta;
+                }
+            }
+
+            gradient = std::move(input_gradient);
+        }
+    };
+
+    std::vector<std::size_t> sample_indices(dataset.size());
+    std::iota(sample_indices.begin(), sample_indices.end(), 0);
+    static std::mt19937 rng(42u);
+    std::shuffle(sample_indices.begin(), sample_indices.end(), rng);
+
+    for (std::size_t begin = 0; begin < sample_indices.size(); begin += batch_size) {
+        const std::size_t end = std::min(begin + batch_size, sample_indices.size());
+        const std::size_t current_batch_size = end - begin;
+        clear_batch_grads();
+
+        for (std::size_t pos = begin; pos < end; ++pos) {
+            const DefectSample &sample = dataset.sample(sample_indices[pos]);
+            const ForwardCache cache = forward_with_cache_for_backend(sample.features, backend);
+            const std::vector<float> &current = cache.op_outputs.back();
+            const float target = static_cast<float>(sample.label);
+            if (current.empty()) {
+                throw std::runtime_error("Network output is empty");
+            }
+
+            total_loss += compute_loss(current[0], target, loss_type, positive_class_weight_, negative_class_weight_);
+            accumulate_sample_gradients(cache, target);
+        }
+
+        const float inv_batch = 1.0f / static_cast<float>(current_batch_size);
+        for (std::size_t layer_idx = 0; layer_idx < layers_.size(); ++layer_idx) {
+            DenseLayer &layer = layers_[layer_idx];
+            LayerGradients &layer_grad = batch_grads[layer_idx];
+
+            for (std::size_t i = 0; i < layer.host_weights.size(); ++i) {
+                layer.host_weights[i] -= learning_rate * layer_grad.d_weights[i] * inv_batch;
+            }
+            for (std::size_t i = 0; i < layer.host_biases.size(); ++i) {
+                layer.host_biases[i] -= learning_rate * layer_grad.d_biases[i] * inv_batch;
+            }
+        }
+
+        if (backend == ExecutionBackend::GPU) {
+            // GPU forward path reads device-side parameters, so batch updates must be flushed each step.
+            sync_all_layers_to_device_gpu();
         }
     }
 
@@ -700,26 +826,29 @@ float MlpNetwork::train_one_epoch_internal(const ManufacturingDefectDataset &dat
 
 float MlpNetwork::train_one_epoch_cpu(const ManufacturingDefectDataset &dataset,
                                       float learning_rate,
-                                      LossType loss_type)
+                                      LossType loss_type,
+                                      std::size_t batch_size)
 {
-    return train_one_epoch_internal(dataset, learning_rate, loss_type, ExecutionBackend::CPU);
+    return train_one_epoch_internal(dataset, learning_rate, loss_type, ExecutionBackend::CPU, batch_size);
 }
 
 float MlpNetwork::train_one_epoch_gpu(const ManufacturingDefectDataset &dataset,
                                       float learning_rate,
-                                      LossType loss_type)
+                                      LossType loss_type,
+                                      std::size_t batch_size)
 {
-    return train_one_epoch_internal(dataset, learning_rate, loss_type, ExecutionBackend::GPU);
+    return train_one_epoch_internal(dataset, learning_rate, loss_type, ExecutionBackend::GPU, batch_size);
 }
 
 float MlpNetwork::train_one_epoch(const ManufacturingDefectDataset &dataset,
                                   float learning_rate,
-                                  LossType loss_type)
+                                  LossType loss_type,
+                                  std::size_t batch_size)
 {
     if (execution_backend_ == ExecutionBackend::CPU) {
-        return train_one_epoch_cpu(dataset, learning_rate, loss_type);
+        return train_one_epoch_cpu(dataset, learning_rate, loss_type, batch_size);
     }
-    return train_one_epoch_gpu(dataset, learning_rate, loss_type);
+    return train_one_epoch_gpu(dataset, learning_rate, loss_type, batch_size);
 }
 
 void MlpNetwork::save_to_file(const std::filesystem::path &model_path) const {
