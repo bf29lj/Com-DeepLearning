@@ -3,6 +3,8 @@ project(first_gpu_program VERSION 0.1.0 LANGUAGES C CXX)
 
 add_executable(first_gpu_program
 	src/main.cpp
+	src/config_io.cpp
+	src/training_pipeline.cpp
 	src/gpu_adapter.cpp
 	src/defect_dataset.cpp
 	src/mlp_network.cpp

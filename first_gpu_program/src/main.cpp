@@ -1,60 +1,20 @@
-#include "defect_dataset.h"
-#include "gpu_adapter.h"
-#include "mlp_network.h"
+#include "training_pipeline.h"
+#include "config_io.h"
 
 #include <cmath>
-#include <cstdint>
-#include <chrono>
-#include <filesystem>
-#include <iomanip>
+#include <cstdlib>
 #include <iostream>
-#include <memory>
+#include <stdexcept>
 #include <string>
-#include <vector>
-#include <fstream>
 
 namespace {
-
-struct TrainingConfig {
-    std::filesystem::path dataset_path;
-    std::filesystem::path load_model_path;
-    std::filesystem::path save_model_path;
-    ExecutionBackend backend = ExecutionBackend::GPU;
-    LossType loss = LossType::BCE;
-    float learning_rate = 0.01f;
-    float lr_decay = 1.0f;
-    std::size_t lr_decay_every = 1;
-    float min_learning_rate = 0.0f;
-    std::filesystem::path results_csv_path;
-    std::filesystem::path pr_csv_path;
-    float positive_class_weight = 1.0f;
-    float negative_class_weight = 1.0f;
-    float threshold = 0.5f;
-    float pr_scan_min = 0.0f;
-    float pr_scan_max = 1.0f;
-    float pr_scan_step = 0.02f;
-    std::size_t batch_size = 1;
-    std::size_t epochs = 20;
-    std::size_t print_every = 1;
-    bool eval_only = false;
-    bool auto_class_weights = false;
-};
-
-struct ClassificationMetrics {
-    std::uint64_t tp = 0;
-    std::uint64_t fp = 0;
-    std::uint64_t tn = 0;
-    std::uint64_t fn = 0;
-    float accuracy = 0.0f;
-    float precision = 0.0f;
-    float recall = 0.0f;
-    float specificity = 0.0f;
-    float f1 = 0.0f;
-};
 
 void print_usage() {
     std::cout << "Usage: first_gpu_program [options]\n"
               << "Options:\n"
+              << "  --config <path>      Import training config INI file\n"
+              << "  --export-config <path> Export merged training config to INI\n"
+              << "  --export-only        Export config(s) and exit without training\n"
               << "  --dataset <path>     Dataset CSV path (default: auto-resolve train.csv)\n"
               << "  --load-model <path>  Load model weights from file before running\n"
               << "  --save-model <path>  Save model weights to file after running\n"
@@ -100,6 +60,28 @@ LossType parse_loss(const std::string &value) {
 TrainingConfig parse_args(int argc, char **argv) {
     TrainingConfig cfg;
 
+    auto first_pass_need_value = [&](int &index, const std::string &name) -> std::string {
+        if (index + 1 >= argc) {
+            throw std::invalid_argument("Missing value for " + name);
+        }
+        return argv[++index];
+    };
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--help") {
+            print_usage();
+            std::exit(0);
+        }
+        if (arg == "--config") {
+            cfg.import_config_path = first_pass_need_value(i, arg);
+        }
+    }
+
+    if (!cfg.import_config_path.empty()) {
+        load_training_config_file(cfg.import_config_path, cfg);
+    }
+
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         auto need_value = [&](const std::string &name) -> std::string {
@@ -112,6 +94,12 @@ TrainingConfig parse_args(int argc, char **argv) {
         if (arg == "--help") {
             print_usage();
             std::exit(0);
+        } else if (arg == "--config") {
+            (void)need_value(arg);
+        } else if (arg == "--export-config") {
+            cfg.export_config_path = need_value(arg);
+        } else if (arg == "--export-only") {
+            cfg.export_only = true;
         } else if (arg == "--dataset") {
             cfg.dataset_path = need_value(arg);
         } else if (arg == "--load-model") {
@@ -177,7 +165,11 @@ TrainingConfig parse_args(int argc, char **argv) {
         }
     }
 
-    if (cfg.dataset_path.empty()) {
+    if (cfg.export_only && cfg.export_config_path.empty()) {
+        throw std::invalid_argument("--export-only requires --export-config");
+    }
+
+    if (cfg.dataset_path.empty() && !cfg.export_only) {
         throw std::invalid_argument("Dataset path is not specified");
     }
 
@@ -218,351 +210,22 @@ TrainingConfig parse_args(int argc, char **argv) {
     return cfg;
 }
 
-const char *backend_name(ExecutionBackend backend) {
-    return backend == ExecutionBackend::GPU ? "GPU" : "CPU";
-}
-
-const char *loss_name(LossType loss) {
-    return loss == LossType::BCE ? "BCE" : "MSE";
-}
-
-float safe_div(std::uint64_t numerator, std::uint64_t denominator) {
-    if (denominator == 0) {
-        return 0.0f;
-    }
-    return static_cast<float>(numerator) / static_cast<float>(denominator);
-}
-
-void compute_auto_class_weights(const ManufacturingDefectDataset &dataset,
-                                float &positive_weight,
-                                float &negative_weight)
-{
-    std::uint64_t positives = 0;
-    std::uint64_t negatives = 0;
-
-    for (const auto &sample : dataset.samples()) {
-        if (sample.label == 1) {
-            ++positives;
-        } else {
-            ++negatives;
-        }
-    }
-
-    if (positives == 0 || negatives == 0) {
-        throw std::runtime_error("Auto class weights require both classes in the dataset");
-    }
-    std::cout << "Dataset class distribution: positives=" << positives << ", negatives=" << negatives << "\n";
-    const std::uint64_t total = positives + negatives;
-    positive_weight = static_cast<float>(total) / (2.0f * static_cast<float>(positives));
-    negative_weight = static_cast<float>(total) / (2.0f * static_cast<float>(negatives));
-}
-
-ClassificationMetrics evaluate_classification_metrics(
-    MlpNetwork &network,
-    const ManufacturingDefectDataset &dataset,
-    float threshold)
-{
-    ClassificationMetrics metrics;
-
-    for (const auto &sample : dataset.samples()) {
-        const std::vector<float> output = network.forward(sample.features);
-        const float probability = output.empty() ? 0.0f : output[0];
-        const int prediction = (probability >= threshold) ? 1 : 0;
-        const int label = static_cast<int>(sample.label);
-
-        if (prediction == 1 && label == 1) {
-            ++metrics.tp;
-        } else if (prediction == 1 && label == 0) {
-            ++metrics.fp;
-        } else if (prediction == 0 && label == 0) {
-            ++metrics.tn;
-        } else {
-            ++metrics.fn;
-        }
-    }
-
-    const std::uint64_t total = metrics.tp + metrics.fp + metrics.tn + metrics.fn;
-    metrics.accuracy = safe_div(metrics.tp + metrics.tn, total);
-    metrics.precision = safe_div(metrics.tp, metrics.tp + metrics.fp);
-    metrics.recall = safe_div(metrics.tp, metrics.tp + metrics.fn);
-    metrics.specificity = safe_div(metrics.tn, metrics.tn + metrics.fp);
-    const float pr_sum = metrics.precision + metrics.recall;
-    metrics.f1 = pr_sum > 0.0f
-        ? 2.0f * (metrics.precision * metrics.recall) / pr_sum
-        : 0.0f;
-
-    return metrics;
-}
-struct ThresholdMetricRow {
-    float threshold = 0.0f;
-    ClassificationMetrics metrics;
-};
-
-struct PrCurveCsvWriter {
-    explicit PrCurveCsvWriter(const std::filesystem::path &path)
-        : out(path, std::ios::out | std::ios::trunc) {
-        if (!out.is_open()) {
-            throw std::runtime_error("Failed to open PR CSV for write: " + path.string());
-        }
-        out << "threshold,precision,recall,f1,specificity,accuracy,tp,fp,tn,fn\n";
-    }
-
-    void write_row(float threshold, const ClassificationMetrics &metrics) {
-        out << threshold << ','
-            << metrics.precision << ','
-            << metrics.recall << ','
-            << metrics.f1 << ','
-            << metrics.specificity << ','
-            << metrics.accuracy << ','
-            << metrics.tp << ','
-            << metrics.fp << ','
-            << metrics.tn << ','
-            << metrics.fn << '\n';
-        if (!out.good()) {
-            throw std::runtime_error("Failed to write PR CSV row");
-        }
-    }
-
-    std::ofstream out;
-};
-
-ClassificationMetrics evaluate_threshold_metrics(
-    MlpNetwork &network,
-    const ManufacturingDefectDataset &dataset,
-    float threshold)
-{
-    return evaluate_classification_metrics(network, dataset, threshold);
-}
-
-std::vector<ThresholdMetricRow> scan_pr_curve(MlpNetwork &network,
-                                          const ManufacturingDefectDataset &dataset,
-                                          float min_threshold,
-                                          float max_threshold,
-                                          float step)
-{
-    std::vector<ThresholdMetricRow> rows;
-    for (float threshold = min_threshold; threshold <= max_threshold + 1e-6f; threshold += step) {
-        rows.push_back({threshold, evaluate_threshold_metrics(network, dataset, threshold)});
-    }
-    return rows;
-}
-
-void print_classification_metrics(const ClassificationMetrics &metrics) {
-    std::cout << "Confusion matrix: TP=" << metrics.tp
-              << ", FP=" << metrics.fp
-              << ", TN=" << metrics.tn
-              << ", FN=" << metrics.fn << "\n";
-
-    std::cout << std::fixed << std::setprecision(6)
-              << "Accuracy=" << metrics.accuracy
-              << ", Precision=" << metrics.precision
-              << ", Recall=" << metrics.recall
-              << ", Specificity=" << metrics.specificity
-              << ", F1=" << metrics.f1 << "\n";
-    std::cout.unsetf(std::ios::floatfield);
-}
-
-struct ResultsCsvWriter {
-    explicit ResultsCsvWriter(const std::filesystem::path &path)
-        : out(path, std::ios::out | std::ios::trunc) {
-        if (!out.is_open()) {
-            throw std::runtime_error("Failed to open results CSV for write: " + path.string());
-        }
-        out << "phase,epoch,train_loss,eval_cost,tp,fp,tn,fn,accuracy,precision,recall,specificity,f1,elapsed_ms\n";
-    }
-
-    void write_row(const std::string &phase,
-                   std::size_t epoch,
-                   float train_loss,
-                   float eval_cost,
-                   const ClassificationMetrics &metrics,
-                   std::uint64_t elapsed_ms)
-    {
-        out << phase << ','
-            << epoch << ','
-            << train_loss << ','
-            << eval_cost << ','
-            << metrics.tp << ','
-            << metrics.fp << ','
-            << metrics.tn << ','
-            << metrics.fn << ','
-            << metrics.accuracy << ','
-            << metrics.precision << ','
-            << metrics.recall << ','
-            << metrics.specificity << ','
-            << metrics.f1 << ','
-            << elapsed_ms << '\n';
-        if (!out.good()) {
-            throw std::runtime_error("Failed to write results CSV row");
-        }
-    }
-
-    std::ofstream out;
-};
-
 }  // namespace
 
 int main(int argc, char **argv) {
     try {
         const TrainingConfig config = parse_args(argc, argv);
+        const NetworkBlueprint blueprint = make_default_mlp_blueprint();
 
-        GpuContext ctx = GpuContext::create_default();
-        std::cout << ctx.get_device_info();
-        std::cout << "\n";
-
-        const auto dataset = ManufacturingDefectDataset::load_csv(config.dataset_path);
-        std::cout << "Loaded samples: " << dataset.size() << "\n";
-        std::cout << "Feature count: " << dataset.feature_count() << "\n\n";
-
-        std::vector<OperationConfig> operations = {
-            OperationConfig::linear(dataset.feature_count(), 14),
-            OperationConfig::relu(),
-            OperationConfig::linear(14, 10),
-            OperationConfig::relu(),
-            OperationConfig::linear(10, 8),
-            OperationConfig::relu(),
-            OperationConfig::linear(8, 1),
-            OperationConfig::sigmoid(),
-        };
-        MlpNetwork network(ctx, std::move(operations));
-        network.set_execution_backend(config.backend);
-
-        if (!config.load_model_path.empty()) {
-            network.load_from_file(config.load_model_path);
-            std::cout << "Loaded model: " << config.load_model_path.string() << "\n";
+        if (!config.export_config_path.empty()) {
+            save_training_config_file(config.export_config_path, config);
+            std::cout << "Exported training config: " << config.export_config_path.string() << "\n";
+        }
+        if (config.export_only) {
+            return 0;
         }
 
-        float positive_weight = config.positive_class_weight;
-        float negative_weight = config.negative_class_weight;
-        if (config.auto_class_weights) {
-            compute_auto_class_weights(dataset, positive_weight, negative_weight);
-        }
-        network.set_class_weights(positive_weight, negative_weight);
-        std::cout << "Using BCE class weights: pos=" << positive_weight
-                  << ", neg=" << negative_weight << "\n";
-        std::cout << "Loss function: " << loss_name(config.loss) << "\n";
-        std::cout << "Execution backend: " << backend_name(config.backend) << "\n";
-        std::cout << "Learning rate: " << config.learning_rate << "\n";
-        std::cout << "LR decay: " << config.lr_decay
-              << " every " << config.lr_decay_every
-              << " epoch(s), min_lr=" << config.min_learning_rate << "\n";
-        std::cout << "Auto class weights: " << (config.auto_class_weights ? "true" : "false") << "\n";
-        std::cout << "Threshold: " << config.threshold << "\n";
-        std::cout << "Batch size: " << config.batch_size << "\n";
-        std::cout << "Epochs: " << config.epochs << "\n";
-        std::cout << "Print every: " << config.print_every << "\n";
-        std::cout << "Eval only: " << (config.eval_only ? "true" : "false") << "\n";
-        std::cout << "Dataset path: " << config.dataset_path.string() << "\n\n";
-
-        const float before_cost = network.evaluate_cost(dataset, config.loss);
-        std::cout << "Initial cost: " << before_cost << "\n";
-        const ClassificationMetrics initial_metrics =
-            evaluate_classification_metrics(network, dataset, config.threshold);
-        print_classification_metrics(initial_metrics);
-
-        std::unique_ptr<ResultsCsvWriter> csv_writer;
-        if (!config.results_csv_path.empty()) {
-            csv_writer = std::make_unique<ResultsCsvWriter>(config.results_csv_path);
-            csv_writer->write_row("initial", 0, 0.0f, before_cost, initial_metrics, 0);
-            std::cout << "Results CSV: " << config.results_csv_path.string() << "\n";
-        }
-
-        float last_eval_cost = before_cost;
-        ClassificationMetrics last_metrics = initial_metrics;
-        float accumulated_train_loss = 0.0f;
-        auto training_start = std::chrono::high_resolution_clock::now();
-
-        if (!config.eval_only) {
-            for (std::size_t epoch = 1; epoch <= config.epochs; ++epoch) {
-                const auto epoch_start = std::chrono::high_resolution_clock::now();
-                const std::size_t decay_steps = (epoch - 1) / config.lr_decay_every;
-                float current_lr = config.learning_rate;
-                if (config.lr_decay < 1.0f && decay_steps > 0) {
-                    current_lr *= std::pow(config.lr_decay, static_cast<float>(decay_steps));
-                }
-                if (current_lr < config.min_learning_rate) {
-                    current_lr = config.min_learning_rate;
-                }
-
-                const float epoch_train_loss = network.train_one_epoch(
-                    dataset,
-                    current_lr,
-                    config.loss,
-                    config.batch_size);
-                const auto epoch_end = std::chrono::high_resolution_clock::now();
-                const auto epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(epoch_end - epoch_start);
-                accumulated_train_loss += epoch_train_loss;
-
-                const bool should_log = (epoch % config.print_every == 0) || (epoch == config.epochs);
-                if (should_log) {
-                    const auto eval_start = std::chrono::high_resolution_clock::now();
-                    last_eval_cost = network.evaluate_cost(dataset, config.loss);
-                    last_metrics = evaluate_classification_metrics(network, dataset, config.threshold);
-                    const auto eval_end = std::chrono::high_resolution_clock::now();
-                    const auto eval_ms = std::chrono::duration_cast<std::chrono::milliseconds>(eval_end - eval_start);
-
-                    std::cout << "[Epoch " << epoch << "/" << config.epochs << "] "
-                              << "train_loss=" << epoch_train_loss
-                              << ", lr=" << current_lr
-                              << ", eval_cost=" << last_eval_cost
-                              << ", train_time=" << epoch_ms.count() << " ms"
-                              << ", eval_time=" << eval_ms.count() << " ms\n";
-                    print_classification_metrics(last_metrics);
-                    if (csv_writer != nullptr) {
-                        csv_writer->write_row("epoch", epoch, epoch_train_loss, last_eval_cost, last_metrics, eval_ms.count());
-                    }
-                }
-            }
-        } else {
-            const auto eval_start = std::chrono::high_resolution_clock::now();
-            last_eval_cost = network.evaluate_cost(dataset, config.loss);
-            last_metrics = evaluate_classification_metrics(network, dataset, config.threshold);
-            const auto eval_end = std::chrono::high_resolution_clock::now();
-            const auto eval_ms = std::chrono::duration_cast<std::chrono::milliseconds>(eval_end - eval_start);
-            std::cout << "Eval-only cost: " << last_eval_cost
-                      << ", eval_time=" << eval_ms.count() << " ms\n";
-            print_classification_metrics(last_metrics);
-            if (csv_writer != nullptr) {
-                csv_writer->write_row("eval_only", 0, 0.0f, last_eval_cost, last_metrics, eval_ms.count());
-            }
-        }
-
-        const auto training_end = std::chrono::high_resolution_clock::now();
-        const auto total_training_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(training_end - training_start);
-
-        const float average_train_loss = config.eval_only
-            ? 0.0f
-            : accumulated_train_loss / static_cast<float>(config.epochs);
-
-        if (!config.save_model_path.empty()) {
-            network.save_to_file(config.save_model_path);
-            std::cout << "Saved model: " << config.save_model_path.string() << "\n";
-        }
-
-        std::cout << "\nTraining summary:\n";
-        if (!config.eval_only) {
-            std::cout << "Average epoch train loss: " << average_train_loss << "\n";
-        }
-        std::cout << "Final eval cost: " << last_eval_cost << "\n";
-        std::cout << "Total training time: " << total_training_ms.count() << " ms\n";
-
-        if (!config.pr_csv_path.empty()) {
-            const auto pr_rows = scan_pr_curve(
-                network,
-                dataset,
-                config.pr_scan_min,
-                config.pr_scan_max,
-                config.pr_scan_step);
-
-            PrCurveCsvWriter pr_writer(config.pr_csv_path);
-            for (const auto &row : pr_rows) {
-                pr_writer.write_row(row.threshold, row.metrics);
-            }
-            std::cout << "PR CSV: " << config.pr_csv_path.string() << " ("
-                      << pr_rows.size() << " thresholds)\n";
-        }
-
+        run_training_pipeline(config, blueprint);
         return 0;
     } catch (const std::exception &e) {
         std::cerr << "Error: " << e.what() << std::endl;
