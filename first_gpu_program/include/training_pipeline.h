@@ -14,6 +14,8 @@ public:
     NetworkBlueprint &insert_activation(ActivationType activation);
     NetworkBlueprint &insert_relu() { return insert_activation(ActivationType::Relu); }
     NetworkBlueprint &insert_sigmoid() { return insert_activation(ActivationType::Sigmoid); }
+    NetworkBlueprint &insert_tanh() { return insert_activation(ActivationType::Tanh); }
+    NetworkBlueprint &insert_leaky_relu() { return insert_activation(ActivationType::LeakyRelu); }
 
     std::vector<OperationConfig> build(std::size_t input_features) const;
 
@@ -37,9 +39,14 @@ struct TrainingConfig {
     std::filesystem::path import_network_config_path;
     std::filesystem::path export_config_path;
     std::filesystem::path export_network_config_path;
-    ExecutionBackend backend = ExecutionBackend::GPU;
+    ExecutionBackend backend = ExecutionBackend::CPU;
     LossType loss = LossType::BCE;
+    OptimizerType optimizer = OptimizerType::SGD;
     float learning_rate = 0.01f;
+    float momentum = 0.9f;
+    float adam_beta1 = 0.9f;
+    float adam_beta2 = 0.999f;
+    float adam_epsilon = 1e-8f;
     float lr_decay = 1.0f;
     std::size_t lr_decay_every = 1;
     float min_learning_rate = 0.0f;
@@ -54,6 +61,8 @@ struct TrainingConfig {
     std::size_t batch_size = 1;
     std::size_t epochs = 20;
     std::size_t print_every = 1;
+    ActivationType hidden_activation = ActivationType::Relu;
+    ActivationType output_activation = ActivationType::Sigmoid;
     bool export_only = false;
     bool eval_only = false;
     bool auto_class_weights = false;
@@ -81,4 +90,5 @@ struct TrainingRunResult {
 
 TrainingRunResult run_training_pipeline(const TrainingConfig &config,
                                         const NetworkBlueprint &blueprint);
-NetworkBlueprint make_default_mlp_blueprint();
+NetworkBlueprint make_default_mlp_blueprint(ActivationType hidden_activation = ActivationType::Relu,
+                                            ActivationType output_activation = ActivationType::Sigmoid);

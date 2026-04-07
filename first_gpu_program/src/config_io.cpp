@@ -193,6 +193,19 @@ void load_training_config_file(const std::filesystem::path &path, TrainingConfig
         }
     }
 
+    const std::string optimizer = to_lower(get_or_empty(sections, "runtime", "optimizer"));
+    if (!optimizer.empty()) {
+        if (optimizer == "sgd") {
+            config.optimizer = OptimizerType::SGD;
+        } else if (optimizer == "momentum") {
+            config.optimizer = OptimizerType::Momentum;
+        } else if (optimizer == "adam") {
+            config.optimizer = OptimizerType::Adam;
+        } else {
+            throw std::runtime_error(parse_error_with_context(path, "Invalid optimizer: " + optimizer));
+        }
+    }
+
     const std::string lr = get_or_empty(sections, "runtime", "learning_rate");
     if (!lr.empty()) {
         config.learning_rate = std::stof(lr);
@@ -208,6 +221,56 @@ void load_training_config_file(const std::filesystem::path &path, TrainingConfig
     const std::string min_learning_rate = get_or_empty(sections, "runtime", "min_learning_rate");
     if (!min_learning_rate.empty()) {
         config.min_learning_rate = std::stof(min_learning_rate);
+    }
+    const std::string momentum = get_or_empty(sections, "runtime", "momentum");
+    if (!momentum.empty()) {
+        config.momentum = std::stof(momentum);
+    }
+    const std::string adam_beta1 = get_or_empty(sections, "runtime", "adam_beta1");
+    if (!adam_beta1.empty()) {
+        config.adam_beta1 = std::stof(adam_beta1);
+    }
+    const std::string adam_beta2 = get_or_empty(sections, "runtime", "adam_beta2");
+    if (!adam_beta2.empty()) {
+        config.adam_beta2 = std::stof(adam_beta2);
+    }
+    const std::string adam_epsilon = get_or_empty(sections, "runtime", "adam_epsilon");
+    if (!adam_epsilon.empty()) {
+        config.adam_epsilon = std::stof(adam_epsilon);
+    }
+    const std::string hidden_activation = to_lower(get_or_empty(sections, "runtime", "hidden_activation"));
+    if (!hidden_activation.empty()) {
+        if (hidden_activation == "relu") {
+            config.hidden_activation = ActivationType::Relu;
+        } else if (hidden_activation == "sigmoid") {
+            config.hidden_activation = ActivationType::Sigmoid;
+        } else if (hidden_activation == "tanh") {
+            config.hidden_activation = ActivationType::Tanh;
+        } else if (hidden_activation == "leaky_relu") {
+            config.hidden_activation = ActivationType::LeakyRelu;
+        } else if (hidden_activation == "gelu") {
+            config.hidden_activation = ActivationType::Gelu;
+        } else {
+            throw std::runtime_error(parse_error_with_context(path, "Invalid hidden_activation: " + hidden_activation));
+        }
+    }
+    const std::string output_activation = to_lower(get_or_empty(sections, "runtime", "output_activation"));
+    if (!output_activation.empty()) {
+        if (output_activation == "linear") {
+            config.output_activation = ActivationType::Linear;
+        } else if (output_activation == "relu") {
+            config.output_activation = ActivationType::Relu;
+        } else if (output_activation == "sigmoid") {
+            config.output_activation = ActivationType::Sigmoid;
+        } else if (output_activation == "tanh") {
+            config.output_activation = ActivationType::Tanh;
+        } else if (output_activation == "leaky_relu") {
+            config.output_activation = ActivationType::LeakyRelu;
+        } else if (output_activation == "gelu") {
+            config.output_activation = ActivationType::Gelu;
+        } else {
+            throw std::runtime_error(parse_error_with_context(path, "Invalid output_activation: " + output_activation));
+        }
     }
     const std::string batch_size = get_or_empty(sections, "runtime", "batch_size");
     if (!batch_size.empty()) {
@@ -278,10 +341,45 @@ void save_training_config_file(const std::filesystem::path &path, const Training
     out << "[runtime]\n";
     out << "backend=" << (config.backend == ExecutionBackend::GPU ? "gpu" : "cpu") << "\n";
     out << "loss=" << (config.loss == LossType::BCE ? "bce" : "mse") << "\n";
+    const char *optimizer = "sgd";
+    if (config.optimizer == OptimizerType::Momentum) {
+        optimizer = "momentum";
+    } else if (config.optimizer == OptimizerType::Adam) {
+        optimizer = "adam";
+    }
+    out << "optimizer=" << optimizer << "\n";
     out << "learning_rate=" << config.learning_rate << "\n";
+    out << "momentum=" << config.momentum << "\n";
+    out << "adam_beta1=" << config.adam_beta1 << "\n";
+    out << "adam_beta2=" << config.adam_beta2 << "\n";
+    out << "adam_epsilon=" << config.adam_epsilon << "\n";
     out << "lr_decay=" << config.lr_decay << "\n";
     out << "lr_decay_every=" << config.lr_decay_every << "\n";
     out << "min_learning_rate=" << config.min_learning_rate << "\n";
+    const char *hidden_activation = "relu";
+    if (config.hidden_activation == ActivationType::Sigmoid) {
+        hidden_activation = "sigmoid";
+    } else if (config.hidden_activation == ActivationType::Tanh) {
+        hidden_activation = "tanh";
+    } else if (config.hidden_activation == ActivationType::LeakyRelu) {
+        hidden_activation = "leaky_relu";
+    } else if (config.hidden_activation == ActivationType::Gelu) {
+        hidden_activation = "gelu";
+    }
+    const char *output_activation = "sigmoid";
+    if (config.output_activation == ActivationType::Linear) {
+        output_activation = "linear";
+    } else if (config.output_activation == ActivationType::Relu) {
+        output_activation = "relu";
+    } else if (config.output_activation == ActivationType::Tanh) {
+        output_activation = "tanh";
+    } else if (config.output_activation == ActivationType::LeakyRelu) {
+        output_activation = "leaky_relu";
+    } else if (config.output_activation == ActivationType::Gelu) {
+        output_activation = "gelu";
+    }
+    out << "hidden_activation=" << hidden_activation << "\n";
+    out << "output_activation=" << output_activation << "\n";
     out << "batch_size=" << config.batch_size << "\n";
     out << "epochs=" << config.epochs << "\n";
     out << "print_every=" << config.print_every << "\n";

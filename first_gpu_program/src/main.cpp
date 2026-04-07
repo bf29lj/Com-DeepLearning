@@ -18,7 +18,14 @@ void print_usage() {
               << "  --dataset <path>     Dataset CSV path (default: auto-resolve train.csv)\n"
               << "  --load-model <path>  Load model weights from file before running\n"
               << "  --save-model <path>  Save model weights to file after running\n"
-              << "  --backend <cpu|gpu>  Execution backend (default: gpu)\n"
+              << "  --backend <cpu|gpu>  Execution backend (default: cpu)\n"
+              << "  --optimizer <sgd|momentum|adam> Optimizer type (default: sgd)\n"
+              << "  --momentum <float>   Momentum factor for momentum SGD (default: 0.9)\n"
+              << "  --adam-beta1 <float> Adam beta1 (default: 0.9)\n"
+              << "  --adam-beta2 <float> Adam beta2 (default: 0.999)\n"
+              << "  --adam-eps <float>   Adam epsilon (default: 1e-8)\n"
+              << "  --hidden-act <relu|sigmoid|tanh|leaky_relu|gelu> Hidden layer activation (default: relu)\n"
+              << "  --output-act <linear|sigmoid|tanh|relu|leaky_relu|gelu> Output activation (default: sigmoid)\n"
               << "  --results-csv <path> Write per-epoch metrics to CSV\n"
               << "  --pr-csv <path>      Write threshold scan for PR curve to CSV\n"
               << "  --loss <bce|mse>     Loss function (default: bce)\n"
@@ -55,6 +62,41 @@ LossType parse_loss(const std::string &value) {
         return LossType::MSE;
     }
     throw std::invalid_argument("Invalid loss: " + value + ". Use bce or mse.");
+}
+
+OptimizerType parse_optimizer(const std::string &value) {
+    if (value == "sgd") {
+        return OptimizerType::SGD;
+    }
+    if (value == "momentum") {
+        return OptimizerType::Momentum;
+    }
+    if (value == "adam") {
+        return OptimizerType::Adam;
+    }
+    throw std::invalid_argument("Invalid optimizer: " + value + ". Use sgd, momentum or adam.");
+}
+
+ActivationType parse_activation(const std::string &value) {
+    if (value == "linear") {
+        return ActivationType::Linear;
+    }
+    if (value == "relu") {
+        return ActivationType::Relu;
+    }
+    if (value == "sigmoid") {
+        return ActivationType::Sigmoid;
+    }
+    if (value == "tanh") {
+        return ActivationType::Tanh;
+    }
+    if (value == "leaky_relu") {
+        return ActivationType::LeakyRelu;
+    }
+    if (value == "gelu") {
+        return ActivationType::Gelu;
+    }
+    throw std::invalid_argument("Invalid activation: " + value + ". Use linear/relu/sigmoid/tanh/leaky_relu/gelu.");
 }
 
 TrainingConfig parse_args(int argc, char **argv) {
@@ -110,6 +152,23 @@ TrainingConfig parse_args(int argc, char **argv) {
             cfg.results_csv_path = need_value(arg);
         } else if (arg == "--backend") {
             cfg.backend = parse_backend(need_value(arg));
+        } else if (arg == "--optimizer") {
+            cfg.optimizer = parse_optimizer(need_value(arg));
+        } else if (arg == "--momentum") {
+            cfg.momentum = std::stof(need_value(arg));
+        } else if (arg == "--adam-beta1") {
+            cfg.adam_beta1 = std::stof(need_value(arg));
+        } else if (arg == "--adam-beta2") {
+            cfg.adam_beta2 = std::stof(need_value(arg));
+        } else if (arg == "--adam-eps") {
+            cfg.adam_epsilon = std::stof(need_value(arg));
+        } else if (arg == "--hidden-act") {
+            cfg.hidden_activation = parse_activation(need_value(arg));
+            if (cfg.hidden_activation == ActivationType::Linear) {
+                throw std::invalid_argument("--hidden-act cannot be linear");
+            }
+        } else if (arg == "--output-act") {
+            cfg.output_activation = parse_activation(need_value(arg));
         } else if (arg == "--loss") {
             cfg.loss = parse_loss(need_value(arg));
         } else if (arg == "--lr") {
@@ -173,8 +232,28 @@ TrainingConfig parse_args(int argc, char **argv) {
         throw std::invalid_argument("Dataset path is not specified");
     }
 
+    if (cfg.hidden_activation == ActivationType::Linear) {
+        throw std::invalid_argument("Hidden activation cannot be linear");
+    }
+
+    if (cfg.backend == ExecutionBackend::GPU) {
+        throw std::invalid_argument("GPU backend is still under development. Please use --backend cpu.");
+    }
+
     if (cfg.learning_rate <= 0.0f || !std::isfinite(cfg.learning_rate)) {
         throw std::invalid_argument("--lr must be a positive finite number");
+    }
+    if (cfg.momentum < 0.0f || cfg.momentum >= 1.0f || !std::isfinite(cfg.momentum)) {
+        throw std::invalid_argument("--momentum must be in [0, 1)");
+    }
+    if (cfg.adam_beta1 <= 0.0f || cfg.adam_beta1 >= 1.0f || !std::isfinite(cfg.adam_beta1)) {
+        throw std::invalid_argument("--adam-beta1 must be in (0, 1)");
+    }
+    if (cfg.adam_beta2 <= 0.0f || cfg.adam_beta2 >= 1.0f || !std::isfinite(cfg.adam_beta2)) {
+        throw std::invalid_argument("--adam-beta2 must be in (0, 1)");
+    }
+    if (cfg.adam_epsilon <= 0.0f || !std::isfinite(cfg.adam_epsilon)) {
+        throw std::invalid_argument("--adam-eps must be positive");
     }
     if (cfg.lr_decay <= 0.0f || cfg.lr_decay > 1.0f || !std::isfinite(cfg.lr_decay)) {
         throw std::invalid_argument("--lr-decay must be in (0, 1]");
@@ -215,7 +294,9 @@ TrainingConfig parse_args(int argc, char **argv) {
 int main(int argc, char **argv) {
     try {
         const TrainingConfig config = parse_args(argc, argv);
-        const NetworkBlueprint blueprint = make_default_mlp_blueprint();
+        const NetworkBlueprint blueprint = make_default_mlp_blueprint(
+            config.hidden_activation,
+            config.output_activation);
 
         if (!config.export_config_path.empty()) {
             save_training_config_file(config.export_config_path, config);

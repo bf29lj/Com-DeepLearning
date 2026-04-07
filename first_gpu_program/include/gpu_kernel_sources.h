@@ -33,6 +33,29 @@ constexpr const char *CORE_KERNEL_SOURCE = R"CLC(
         const uint index = get_global_id(0);
         values[index] = 1.0f / (1.0f + exp(-values[index]));
     }
+
+    __kernel void tanh_activation(__global float *values)
+    {
+        const uint index = get_global_id(0);
+        values[index] = tanh(values[index]);
+    }
+
+    __kernel void leaky_relu_activation(__global float *values)
+    {
+        const uint index = get_global_id(0);
+        const float x = values[index];
+        values[index] = x > 0.0f ? x : 0.01f * x;
+    }
+
+    __kernel void gelu_activation(__global float *values)
+    {
+        const uint index = get_global_id(0);
+        const float x = values[index];
+        const float c = 0.044715f;
+        const float s = 0.7978845608f;
+        const float u = s * (x + c * x * x * x);
+        values[index] = 0.5f * x * (1.0f + tanh(u));
+    }
 )CLC";
 
 // Common math/loss kernels for training or metric computation.
@@ -52,6 +75,40 @@ constexpr const char *MATH_KERNEL_SOURCE = R"CLC(
         const uint idx = get_global_id(0);
         const float a = activated[idx];
         derivative[idx] = a * (1.0f - a);
+    }
+
+    __kernel void tanh_derivative(
+        __global const float *activated,
+        __global float *derivative)
+    {
+        const uint idx = get_global_id(0);
+        const float a = activated[idx];
+        derivative[idx] = 1.0f - a * a;
+    }
+
+    __kernel void leaky_relu_derivative(
+        __global const float *activated,
+        __global float *derivative)
+    {
+        const uint idx = get_global_id(0);
+        derivative[idx] = activated[idx] > 0.0f ? 1.0f : 0.01f;
+    }
+
+    __kernel void gelu_derivative(
+        __global const float *input,
+        __global float *derivative)
+    {
+        const uint idx = get_global_id(0);
+        const float x = input[idx];
+        const float c = 0.044715f;
+        const float s = 0.7978845608f;
+        const float x2 = x * x;
+        const float x3 = x2 * x;
+        const float u = s * (x + c * x3);
+        const float t = tanh(u);
+        const float sech2 = 1.0f - t * t;
+        const float du_dx = s * (1.0f + 3.0f * c * x2);
+        derivative[idx] = 0.5f * (1.0f + t) + 0.5f * x * sech2 * du_dx;
     }
 
     __kernel void mse_loss_elementwise(

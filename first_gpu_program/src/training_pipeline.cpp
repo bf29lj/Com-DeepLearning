@@ -1,7 +1,6 @@
 #include "training_pipeline.h"
 
 #include "defect_dataset.h"
-#include "gpu_adapter.h"
 
 #include <chrono>
 #include <cmath>
@@ -16,6 +15,36 @@ namespace {
 
 const char *backend_name(ExecutionBackend backend) {
     return backend == ExecutionBackend::GPU ? "GPU" : "CPU";
+}
+
+const char *optimizer_name(OptimizerType optimizer) {
+    switch (optimizer) {
+        case OptimizerType::SGD:
+            return "SGD";
+        case OptimizerType::Momentum:
+            return "Momentum";
+        case OptimizerType::Adam:
+            return "Adam";
+    }
+    return "Unknown";
+}
+
+const char *activation_name(ActivationType activation) {
+    switch (activation) {
+        case ActivationType::Linear:
+            return "linear";
+        case ActivationType::Relu:
+            return "relu";
+        case ActivationType::Sigmoid:
+            return "sigmoid";
+        case ActivationType::Tanh:
+            return "tanh";
+        case ActivationType::LeakyRelu:
+            return "leaky_relu";
+        case ActivationType::Gelu:
+            return "gelu";
+    }
+    return "unknown";
 }
 
 }  // namespace
@@ -61,6 +90,12 @@ std::vector<OperationConfig> NetworkBlueprint::build(std::size_t input_features)
             operations.push_back(OperationConfig::relu());
         } else if (step.activation == ActivationType::Sigmoid) {
             operations.push_back(OperationConfig::sigmoid());
+        } else if (step.activation == ActivationType::Tanh) {
+            operations.push_back(OperationConfig::tanh());
+        } else if (step.activation == ActivationType::LeakyRelu) {
+            operations.push_back(OperationConfig::leaky_relu());
+        } else if (step.activation == ActivationType::Gelu) {
+            operations.push_back(OperationConfig::gelu());
         } else {
             throw std::invalid_argument("Unsupported activation in NetworkBlueprint");
         }
@@ -69,16 +104,17 @@ std::vector<OperationConfig> NetworkBlueprint::build(std::size_t input_features)
     return operations;
 }
 
-NetworkBlueprint make_default_mlp_blueprint() {
+NetworkBlueprint make_default_mlp_blueprint(ActivationType hidden_activation,
+                                            ActivationType output_activation) {
     NetworkBlueprint blueprint;
     blueprint.insert_linear(14)
-        .insert_relu()
+        .insert_activation(hidden_activation)
         .insert_linear(10)
-        .insert_relu()
+        .insert_activation(hidden_activation)
         .insert_linear(8)
-        .insert_relu()
+        .insert_activation(hidden_activation)
         .insert_linear(1)
-        .insert_sigmoid();
+        .insert_activation(output_activation);
     return blueprint;
 }
 
@@ -259,18 +295,30 @@ struct ResultsCsvWriter {
 
 TrainingRunResult run_training_pipeline(const TrainingConfig &config,
                                         const NetworkBlueprint &blueprint) {
-    GpuContext ctx = GpuContext::create_default();
-    std::cout << ctx.get_device_info();
-    std::cout << "\n";
-
     const auto dataset = ManufacturingDefectDataset::load_csv(config.dataset_path);
     std::cout << "Loaded samples: " << dataset.size() << "\n";
     std::cout << "Feature count: " << dataset.feature_count() << "\n\n";
 
-    const std::vector<OperationConfig> operations =
-        blueprint.build(dataset.feature_count());
-    MlpNetwork network(ctx, std::move(operations));
+    std::vector<OperationConfig> operations;
+    if (!config.load_model_path.empty()) {
+        operations = MlpNetwork::load_operations_from_file(config.load_model_path);
+        if (operations.empty() || operations.front().type != OperationType::Linear) {
+            throw std::runtime_error("Loaded model file does not contain a valid network architecture");
+        }
+        if (operations.front().input_size != dataset.feature_count()) {
+            throw std::runtime_error("Loaded model input size does not match dataset feature count");
+        }
+    } else {
+        operations = blueprint.build(dataset.feature_count());
+    }
+    MlpNetwork network(std::move(operations));
     network.set_execution_backend(config.backend);
+    network.set_optimizer_type(config.optimizer);
+    network.set_optimizer_hyperparameters(
+        config.momentum,
+        config.adam_beta1,
+        config.adam_beta2,
+        config.adam_epsilon);
 
     if (!config.load_model_path.empty()) {
         network.load_from_file(config.load_model_path);
@@ -286,7 +334,17 @@ TrainingRunResult run_training_pipeline(const TrainingConfig &config,
     std::cout << "Using BCE class weights: pos=" << positive_weight
               << ", neg=" << negative_weight << "\n";
     std::cout << "Loss function: " << loss_name(config.loss) << "\n";
+    std::cout << "Optimizer: " << optimizer_name(config.optimizer) << "\n";
+    if (config.optimizer == OptimizerType::Momentum) {
+        std::cout << "Momentum: " << config.momentum << "\n";
+    } else if (config.optimizer == OptimizerType::Adam) {
+        std::cout << "Adam betas: beta1=" << config.adam_beta1
+                  << ", beta2=" << config.adam_beta2
+                  << ", epsilon=" << config.adam_epsilon << "\n";
+    }
     std::cout << "Execution backend: " << backend_name(config.backend) << "\n";
+    std::cout << "Hidden activation: " << activation_name(config.hidden_activation) << "\n";
+    std::cout << "Output activation: " << activation_name(config.output_activation) << "\n";
     std::cout << "Learning rate: " << config.learning_rate << "\n";
     std::cout << "LR decay: " << config.lr_decay
               << " every " << config.lr_decay_every

@@ -73,6 +73,42 @@ struct SigmoidActivationKernel {
     }
 };
 
+// tanh_activation kernel: values
+struct TanhActivationKernel {
+    using Params = std::tuple<BufferParam>;
+    static constexpr const char *name = "tanh_activation";
+    static constexpr size_t param_count = 1;
+
+    template <typename T1>
+    static constexpr bool verify_params() {
+        return std::is_same_v<T1, BufferParam>;
+    }
+};
+
+// leaky_relu_activation kernel: values
+struct LeakyReluActivationKernel {
+    using Params = std::tuple<BufferParam>;
+    static constexpr const char *name = "leaky_relu_activation";
+    static constexpr size_t param_count = 1;
+
+    template <typename T1>
+    static constexpr bool verify_params() {
+        return std::is_same_v<T1, BufferParam>;
+    }
+};
+
+// gelu_activation kernel: values
+struct GeluActivationKernel {
+    using Params = std::tuple<BufferParam>;
+    static constexpr const char *name = "gelu_activation";
+    static constexpr size_t param_count = 1;
+
+    template <typename T1>
+    static constexpr bool verify_params() {
+        return std::is_same_v<T1, BufferParam>;
+    }
+};
+
 // Type-safe kernel argument builder
 template <typename KernelDef>
 class TypedKernelCall {
