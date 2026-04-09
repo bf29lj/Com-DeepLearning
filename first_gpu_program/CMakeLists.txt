@@ -8,6 +8,7 @@ add_executable(first_gpu_program
 	src/gpu_adapter.cpp
 	src/defect_dataset.cpp
 	src/mlp_network.cpp
+	src/lstm_network.cpp
 )
 
 find_package(Boost REQUIRED)  # Boost.Compute is header-only

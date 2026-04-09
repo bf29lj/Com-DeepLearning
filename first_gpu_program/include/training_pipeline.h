@@ -61,6 +61,8 @@ struct TrainingConfig {
     std::size_t batch_size = 1;
     std::size_t epochs = 20;
     std::size_t print_every = 1;
+    std::size_t lstm_seq_len = 8;
+    std::size_t lstm_hidden_size = 16;
     ActivationType hidden_activation = ActivationType::Relu;
     ActivationType output_activation = ActivationType::Sigmoid;
     bool export_only = false;

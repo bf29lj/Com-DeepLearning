@@ -1,6 +1,7 @@
 #include "training_pipeline.h"
 
 #include "defect_dataset.h"
+#include "lstm_network.h"
 
 #include <chrono>
 #include <cmath>
@@ -122,6 +123,10 @@ namespace {
 
 const char *loss_name(LossType loss) {
     return loss == LossType::BCE ? "BCE" : "MSE";
+}
+
+const char *model_name(const std::string &model_type) {
+    return model_type == "lstm" ? "LSTM" : "MLP";
 }
 
 float safe_div(std::uint64_t numerator, std::uint64_t denominator) {
@@ -291,6 +296,247 @@ struct ResultsCsvWriter {
     std::ofstream out;
 };
 
+std::vector<SequenceSample> build_sequence_dataset(const ManufacturingDefectDataset &dataset,
+                                                   std::size_t seq_len)
+{
+    if (seq_len == 0) {
+        throw std::invalid_argument("LSTM sequence length must be positive");
+    }
+    if (dataset.size() < seq_len) {
+        throw std::runtime_error("Dataset size is smaller than LSTM sequence length");
+    }
+
+    std::vector<SequenceSample> sequences;
+    sequences.reserve(dataset.size() - seq_len + 1);
+    const std::vector<DefectSample> *source = &dataset.samples();
+
+    for (std::size_t start = 0; start + seq_len <= dataset.size(); ++start) {
+        SequenceSample item;
+        item.source_samples = source;
+        item.start_index = start;
+        item.length = seq_len;
+        item.label = dataset.sample(start + seq_len - 1).label;
+        sequences.push_back(std::move(item));
+    }
+
+    return sequences;
+}
+
+ClassificationMetrics evaluate_classification_metrics_lstm(
+    LstmNetwork &network,
+    const std::vector<SequenceSample> &dataset,
+    float threshold)
+{
+    ClassificationMetrics metrics;
+
+    for (const auto &sample : dataset) {
+        const float probability = network.predict_probability(sample);
+        const int prediction = (probability >= threshold) ? 1 : 0;
+        const int label = static_cast<int>(sample.label);
+
+        if (prediction == 1 && label == 1) {
+            ++metrics.tp;
+        } else if (prediction == 1 && label == 0) {
+            ++metrics.fp;
+        } else if (prediction == 0 && label == 0) {
+            ++metrics.tn;
+        } else {
+            ++metrics.fn;
+        }
+    }
+
+    const std::uint64_t total = metrics.tp + metrics.fp + metrics.tn + metrics.fn;
+    metrics.accuracy = safe_div(metrics.tp + metrics.tn, total);
+    metrics.precision = safe_div(metrics.tp, metrics.tp + metrics.fp);
+    metrics.recall = safe_div(metrics.tp, metrics.tp + metrics.fn);
+    metrics.specificity = safe_div(metrics.tn, metrics.tn + metrics.fp);
+    const float pr_sum = metrics.precision + metrics.recall;
+    metrics.f1 = pr_sum > 0.0f
+        ? 2.0f * (metrics.precision * metrics.recall) / pr_sum
+        : 0.0f;
+
+    return metrics;
+}
+
+std::vector<ThresholdMetricRow> scan_pr_curve_lstm(LstmNetwork &network,
+                                                   const std::vector<SequenceSample> &dataset,
+                                                   float min_threshold,
+                                                   float max_threshold,
+                                                   float step)
+{
+    std::vector<ThresholdMetricRow> rows;
+    for (float threshold = min_threshold; threshold <= max_threshold + 1e-6f; threshold += step) {
+        rows.push_back({threshold, evaluate_classification_metrics_lstm(network, dataset, threshold)});
+    }
+    return rows;
+}
+
+TrainingRunResult run_lstm_pipeline(const TrainingConfig &config,
+                                    const ManufacturingDefectDataset &dataset)
+{
+    const auto sequence_dataset = build_sequence_dataset(dataset, config.lstm_seq_len);
+    std::cout << "Model: " << model_name(config.model_type) << "\n";
+    std::cout << "Sequence length: " << config.lstm_seq_len << "\n";
+    std::cout << "LSTM hidden size: " << config.lstm_hidden_size << "\n";
+    std::cout << "Sequence samples: " << sequence_dataset.size() << "\n\n";
+
+    LstmNetwork network(dataset.feature_count(), config.lstm_hidden_size);
+    network.set_optimizer_type(config.optimizer);
+    network.set_optimizer_hyperparameters(
+        config.momentum,
+        config.adam_beta1,
+        config.adam_beta2,
+        config.adam_epsilon);
+
+    if (!config.load_model_path.empty()) {
+        network.load_from_file(config.load_model_path);
+        std::cout << "Loaded model: " << config.load_model_path.string() << "\n";
+    }
+
+    float positive_weight = config.positive_class_weight;
+    float negative_weight = config.negative_class_weight;
+    if (config.auto_class_weights) {
+        compute_auto_class_weights(dataset, positive_weight, negative_weight);
+    }
+    network.set_class_weights(positive_weight, negative_weight);
+
+    std::cout << "Using BCE class weights: pos=" << positive_weight
+              << ", neg=" << negative_weight << "\n";
+    std::cout << "Loss function: " << loss_name(config.loss) << "\n";
+    std::cout << "Optimizer: " << optimizer_name(config.optimizer) << "\n";
+    if (config.optimizer == OptimizerType::Momentum) {
+        std::cout << "Momentum: " << config.momentum << "\n";
+    } else if (config.optimizer == OptimizerType::Adam) {
+        std::cout << "Adam betas: beta1=" << config.adam_beta1
+                  << ", beta2=" << config.adam_beta2
+                  << ", epsilon=" << config.adam_epsilon << "\n";
+    }
+    std::cout << "Execution backend: " << backend_name(config.backend) << "\n";
+    std::cout << "Learning rate: " << config.learning_rate << "\n";
+    std::cout << "LR decay: " << config.lr_decay
+              << " every " << config.lr_decay_every
+              << " epoch(s), min_lr=" << config.min_learning_rate << "\n";
+    std::cout << "Auto class weights: " << (config.auto_class_weights ? "true" : "false") << "\n";
+    std::cout << "Threshold: " << config.threshold << "\n";
+    std::cout << "Batch size: " << config.batch_size << "\n";
+    std::cout << "Epochs: " << config.epochs << "\n";
+    std::cout << "Print every: " << config.print_every << "\n";
+    std::cout << "Eval only: " << (config.eval_only ? "true" : "false") << "\n";
+    std::cout << "Dataset path: " << config.dataset_path.string() << "\n\n";
+
+    TrainingRunResult result;
+    result.initial_cost = network.evaluate_cost(sequence_dataset, config.loss);
+    std::cout << "Initial cost: " << result.initial_cost << "\n";
+    const ClassificationMetrics initial_metrics =
+        evaluate_classification_metrics_lstm(network, sequence_dataset, config.threshold);
+    print_classification_metrics(initial_metrics);
+
+    std::unique_ptr<ResultsCsvWriter> csv_writer;
+    if (!config.results_csv_path.empty()) {
+        csv_writer = std::make_unique<ResultsCsvWriter>(config.results_csv_path);
+        csv_writer->write_row("initial", 0, 0.0f, result.initial_cost, initial_metrics, 0);
+        std::cout << "Results CSV: " << config.results_csv_path.string() << "\n";
+    }
+
+    result.final_eval_cost = result.initial_cost;
+    result.final_metrics = initial_metrics;
+    float accumulated_train_loss = 0.0f;
+    const auto training_start = std::chrono::high_resolution_clock::now();
+
+    if (!config.eval_only) {
+        for (std::size_t epoch = 1; epoch <= config.epochs; ++epoch) {
+            const auto epoch_start = std::chrono::high_resolution_clock::now();
+            const std::size_t decay_steps = (epoch - 1) / config.lr_decay_every;
+            float current_lr = config.learning_rate;
+            if (config.lr_decay < 1.0f && decay_steps > 0) {
+                current_lr *= std::pow(config.lr_decay, static_cast<float>(decay_steps));
+            }
+            if (current_lr < config.min_learning_rate) {
+                current_lr = config.min_learning_rate;
+            }
+
+            const float epoch_train_loss = network.train_one_epoch(
+                sequence_dataset,
+                current_lr,
+                config.loss,
+                config.batch_size);
+            const auto epoch_end = std::chrono::high_resolution_clock::now();
+            const auto epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(epoch_end - epoch_start);
+            accumulated_train_loss += epoch_train_loss;
+
+            const bool should_log = (epoch % config.print_every == 0) || (epoch == config.epochs);
+            if (should_log) {
+                const auto eval_start = std::chrono::high_resolution_clock::now();
+                result.final_eval_cost = network.evaluate_cost(sequence_dataset, config.loss);
+                result.final_metrics = evaluate_classification_metrics_lstm(network, sequence_dataset, config.threshold);
+                const auto eval_end = std::chrono::high_resolution_clock::now();
+                const auto eval_ms = std::chrono::duration_cast<std::chrono::milliseconds>(eval_end - eval_start);
+
+                std::cout << "[Epoch " << epoch << "/" << config.epochs << "] "
+                          << "train_loss=" << epoch_train_loss
+                          << ", lr=" << current_lr
+                          << ", eval_cost=" << result.final_eval_cost
+                          << ", train_time=" << epoch_ms.count() << " ms"
+                          << ", eval_time=" << eval_ms.count() << " ms\n";
+                print_classification_metrics(result.final_metrics);
+                if (csv_writer != nullptr) {
+                    csv_writer->write_row("epoch", epoch, epoch_train_loss, result.final_eval_cost, result.final_metrics, eval_ms.count());
+                }
+            }
+        }
+    } else {
+        const auto eval_start = std::chrono::high_resolution_clock::now();
+        result.final_eval_cost = network.evaluate_cost(sequence_dataset, config.loss);
+        result.final_metrics = evaluate_classification_metrics_lstm(network, sequence_dataset, config.threshold);
+        const auto eval_end = std::chrono::high_resolution_clock::now();
+        const auto eval_ms = std::chrono::duration_cast<std::chrono::milliseconds>(eval_end - eval_start);
+        std::cout << "Eval-only cost: " << result.final_eval_cost
+                  << ", eval_time=" << eval_ms.count() << " ms\n";
+        print_classification_metrics(result.final_metrics);
+        if (csv_writer != nullptr) {
+            csv_writer->write_row("eval_only", 0, 0.0f, result.final_eval_cost, result.final_metrics, eval_ms.count());
+        }
+    }
+
+    const auto training_end = std::chrono::high_resolution_clock::now();
+    result.total_training_ms = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(training_end - training_start).count());
+
+    result.average_epoch_train_loss = config.eval_only
+        ? 0.0f
+        : accumulated_train_loss / static_cast<float>(config.epochs);
+
+    if (!config.save_model_path.empty()) {
+        network.save_to_file(config.save_model_path);
+        std::cout << "Saved model: " << config.save_model_path.string() << "\n";
+    }
+
+    std::cout << "\nTraining summary:\n";
+    if (!config.eval_only) {
+        std::cout << "Average epoch train loss: " << result.average_epoch_train_loss << "\n";
+    }
+    std::cout << "Final eval cost: " << result.final_eval_cost << "\n";
+    std::cout << "Total training time: " << result.total_training_ms << " ms\n";
+
+    if (!config.pr_csv_path.empty()) {
+        const auto pr_rows = scan_pr_curve_lstm(
+            network,
+            sequence_dataset,
+            config.pr_scan_min,
+            config.pr_scan_max,
+            config.pr_scan_step);
+
+        PrCurveCsvWriter pr_writer(config.pr_csv_path);
+        for (const auto &row : pr_rows) {
+            pr_writer.write_row(row.threshold, row.metrics);
+        }
+        std::cout << "PR CSV: " << config.pr_csv_path.string() << " ("
+                  << pr_rows.size() << " thresholds)\n";
+    }
+
+    return result;
+}
+
 }  // namespace
 
 TrainingRunResult run_training_pipeline(const TrainingConfig &config,
@@ -298,6 +544,12 @@ TrainingRunResult run_training_pipeline(const TrainingConfig &config,
     const auto dataset = ManufacturingDefectDataset::load_csv(config.dataset_path);
     std::cout << "Loaded samples: " << dataset.size() << "\n";
     std::cout << "Feature count: " << dataset.feature_count() << "\n\n";
+
+    if (config.model_type == "lstm") {
+        return run_lstm_pipeline(config, dataset);
+    }
+
+    std::cout << "Model: " << model_name(config.model_type) << "\n";
 
     std::vector<OperationConfig> operations;
     if (!config.load_model_path.empty()) {

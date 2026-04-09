@@ -16,6 +16,7 @@ void print_usage() {
               << "  --export-config <path> Export merged training config to INI\n"
               << "  --export-only        Export config(s) and exit without training\n"
               << "  --dataset <path>     Dataset CSV path (default: auto-resolve train.csv)\n"
+              << "  --model <mlp|lstm>   Model type (default: mlp)\n"
               << "  --load-model <path>  Load model weights from file before running\n"
               << "  --save-model <path>  Save model weights to file after running\n"
               << "  --backend <cpu|gpu>  Execution backend (default: cpu)\n"
@@ -38,10 +39,19 @@ void print_usage() {
               << "  --auto-class-weights Auto-compute BCE class weights from dataset\n"
               << "  --threshold <float>  Classification threshold [0,1] (default: 0.5)\n"
               << "  --batch-size <int>   Batch size for training updates (default: 1)\n"
+              << "  --seq-len <int>      LSTM sequence length (default: 8)\n"
+              << "  --lstm-hidden <int>  LSTM hidden size (default: 16)\n"
               << "  --epochs <int>       Number of training epochs (default: 20)\n"
               << "  --print-every <int>  Epoch log interval (default: 1)\n"
               << "  --eval-only          Skip training and only run evaluation\n"
               << "  --help               Show this help\n";
+}
+
+std::string parse_model_type(const std::string &value) {
+    if (value == "mlp" || value == "lstm") {
+        return value;
+    }
+    throw std::invalid_argument("Invalid model: " + value + ". Use mlp or lstm.");
 }
 
 ExecutionBackend parse_backend(const std::string &value) {
@@ -144,6 +154,8 @@ TrainingConfig parse_args(int argc, char **argv) {
             cfg.export_only = true;
         } else if (arg == "--dataset") {
             cfg.dataset_path = need_value(arg);
+        } else if (arg == "--model") {
+            cfg.model_type = parse_model_type(need_value(arg));
         } else if (arg == "--load-model") {
             cfg.load_model_path = need_value(arg);
         } else if (arg == "--save-model") {
@@ -205,6 +217,18 @@ TrainingConfig parse_args(int argc, char **argv) {
                 throw std::invalid_argument("--batch-size must be positive");
             }
             cfg.batch_size = static_cast<std::size_t>(batch_size);
+        } else if (arg == "--seq-len") {
+            const int seq_len = std::stoi(need_value(arg));
+            if (seq_len <= 0) {
+                throw std::invalid_argument("--seq-len must be positive");
+            }
+            cfg.lstm_seq_len = static_cast<std::size_t>(seq_len);
+        } else if (arg == "--lstm-hidden") {
+            const int hidden_size = std::stoi(need_value(arg));
+            if (hidden_size <= 0) {
+                throw std::invalid_argument("--lstm-hidden must be positive");
+            }
+            cfg.lstm_hidden_size = static_cast<std::size_t>(hidden_size);
         } else if (arg == "--epochs") {
             const int epochs = std::stoi(need_value(arg));
             if (epochs <= 0) {
@@ -272,6 +296,12 @@ TrainingConfig parse_args(int argc, char **argv) {
     }
     if (cfg.threshold < 0.0f || cfg.threshold > 1.0f || !std::isfinite(cfg.threshold)) {
         throw std::invalid_argument("--threshold must be within [0, 1]");
+    }
+    if (cfg.lstm_seq_len == 0) {
+        throw std::invalid_argument("--seq-len must be positive");
+    }
+    if (cfg.lstm_hidden_size == 0) {
+        throw std::invalid_argument("--lstm-hidden must be positive");
     }
     if (cfg.pr_scan_min < 0.0f || cfg.pr_scan_min > 1.0f || !std::isfinite(cfg.pr_scan_min)) {
         throw std::invalid_argument("--pr-min must be within [0, 1]");

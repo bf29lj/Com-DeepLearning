@@ -129,7 +129,7 @@ void validate_schema(const std::filesystem::path &path,
     }
 
     const std::string model = to_lower(get_or_empty(sections, "meta", "model"));
-    if (!model.empty() && model != "mlp") {
+    if (!model.empty() && model != "mlp" && model != "lstm") {
         throw std::runtime_error(parse_error_with_context(path, "Unsupported model type: " + model));
     }
 }
@@ -149,6 +149,11 @@ void save_config_header(std::ofstream &out,
 void load_training_config_file(const std::filesystem::path &path, TrainingConfig &config) {
     const SectionMap sections = parse_ini_file(path);
     validate_schema(path, sections, "training_config");
+
+    const std::string model = to_lower(get_or_empty(sections, "meta", "model"));
+    if (!model.empty()) {
+        config.model_type = model;
+    }
 
     const std::string dataset = get_or_empty(sections, "paths", "dataset_path");
     if (!dataset.empty()) {
@@ -288,6 +293,14 @@ void load_training_config_file(const std::filesystem::path &path, TrainingConfig
     if (!eval_only.empty()) {
         config.eval_only = parse_bool(eval_only);
     }
+    const std::string lstm_seq_len = get_or_empty(sections, "runtime", "lstm_seq_len");
+    if (!lstm_seq_len.empty()) {
+        config.lstm_seq_len = static_cast<std::size_t>(std::stoul(lstm_seq_len));
+    }
+    const std::string lstm_hidden_size = get_or_empty(sections, "runtime", "lstm_hidden_size");
+    if (!lstm_hidden_size.empty()) {
+        config.lstm_hidden_size = static_cast<std::size_t>(std::stoul(lstm_hidden_size));
+    }
 
     const std::string pos_w = get_or_empty(sections, "metrics", "positive_class_weight");
     if (!pos_w.empty()) {
@@ -329,7 +342,7 @@ void save_training_config_file(const std::filesystem::path &path, const Training
         throw std::runtime_error("Failed to open config file for write: " + path.string());
     }
 
-    save_config_header(out, "training_config", "mlp");
+    save_config_header(out, "training_config", config.model_type);
 
     out << "[paths]\n";
     out << "dataset_path=" << config.dataset_path.string() << "\n";
@@ -383,7 +396,9 @@ void save_training_config_file(const std::filesystem::path &path, const Training
     out << "batch_size=" << config.batch_size << "\n";
     out << "epochs=" << config.epochs << "\n";
     out << "print_every=" << config.print_every << "\n";
-    out << "eval_only=" << (config.eval_only ? "true" : "false") << "\n\n";
+    out << "eval_only=" << (config.eval_only ? "true" : "false") << "\n";
+    out << "lstm_seq_len=" << config.lstm_seq_len << "\n";
+    out << "lstm_hidden_size=" << config.lstm_hidden_size << "\n\n";
 
     out << "[metrics]\n";
     out << "positive_class_weight=" << config.positive_class_weight << "\n";
