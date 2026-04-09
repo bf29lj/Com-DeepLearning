@@ -1,8 +1,10 @@
 #include "mlp_network.h"
+#include "gpu_kernels.h"
 
 #include <algorithm>
 #include <cmath>
 #include <fstream>
+#include <iostream>
 #include <limits>
 #include <numeric>
 #include <random>
@@ -30,6 +32,30 @@ void read_binary(std::ifstream &in, T &value) {
 }
 
 } // namespace
+
+struct MlpNetwork::GpuRuntimeImpl {
+        struct LayerDeviceState {
+            std::unique_ptr<GpuBuffer> weights;
+            std::unique_ptr<GpuBuffer> biases;
+            std::unique_ptr<GpuBuffer> grad_weights;
+            std::unique_ptr<GpuBuffer> grad_biases;
+            std::unique_ptr<GpuBuffer> velocity_weights;
+            std::unique_ptr<GpuBuffer> velocity_biases;
+            std::unique_ptr<GpuBuffer> adam_m_weights;
+            std::unique_ptr<GpuBuffer> adam_v_weights;
+            std::unique_ptr<GpuBuffer> adam_m_biases;
+            std::unique_ptr<GpuBuffer> adam_v_biases;
+        };
+
+        GpuContext context;
+        GpuProgram program;
+        std::vector<LayerDeviceState> layer_states;
+        bool parameters_synced = false;
+
+        GpuRuntimeImpl()
+                : context(GpuContext::create_default()),
+                    program(gpu::create_gpu_program(context)) {}
+};
 
 MlpNetwork::DenseLayer::DenseLayer(std::size_t input,
                                                                      std::size_t output,
@@ -283,7 +309,162 @@ std::vector<float> MlpNetwork::forward_cpu(const std::vector<float> &input) cons
     return cache.op_outputs.back();
 }
 
+void MlpNetwork::ensure_gpu_runtime() const {
+    if (gpu_runtime_ == nullptr) {
+        gpu_runtime_ = std::make_unique<GpuRuntimeImpl>();
+    }
+}
+
+void MlpNetwork::invalidate_gpu_parameter_cache() {
+    if (gpu_runtime_ != nullptr) {
+        gpu_runtime_->parameters_synced = false;
+    }
+}
+
+void MlpNetwork::sync_gpu_layers_to_host() {
+    if (gpu_runtime_ == nullptr || !gpu_runtime_->parameters_synced) {
+        return;
+    }
+
+    for (std::size_t i = 0; i < layers_.size(); ++i) {
+        auto &state = gpu_runtime_->layer_states[i];
+        if (!state.weights || !state.biases) {
+            continue;
+        }
+        layers_[i].host_weights = state.weights->to_host<float>();
+        layers_[i].host_biases = state.biases->to_host<float>();
+    }
+}
+
+namespace {
+
+GpuBuffer make_zero_buffer(GpuContext &context, std::size_t float_count) {
+    std::vector<float> zeros(float_count, 0.0f);
+    return GpuBuffer::from_host(context, zeros);
+}
+
+void enqueue_fill_float(GpuContext &context,
+                        const GpuProgram &program,
+                        GpuBuffer &buffer,
+                        float value,
+                        std::size_t float_count)
+{
+    GpuKernel fill_kernel(program, "fill_float", context);
+    fill_kernel.set_args({
+        KernelArg::buffer(buffer.get_buffer()),
+        KernelArg::scalar_float(value),
+        KernelArg::scalar_uint(static_cast<uint32_t>(float_count)),
+    });
+    fill_kernel.enqueue_1d(float_count);
+}
+
+} // namespace
+
+MlpNetwork::ForwardCache MlpNetwork::forward_with_cache_gpu(const std::vector<float> &input) const {
+    if (operations_.empty()) {
+        throw std::runtime_error("Operation pipeline is empty");
+    }
+    ensure_gpu_runtime();
+
+    if (!gpu_runtime_->parameters_synced) {
+        gpu_runtime_->layer_states.clear();
+        gpu_runtime_->layer_states.resize(layers_.size());
+        for (std::size_t i = 0; i < layers_.size(); ++i) {
+            auto &state = gpu_runtime_->layer_states[i];
+            const DenseLayer &layer = layers_[i];
+            state.weights = std::make_unique<GpuBuffer>(GpuBuffer::from_host(gpu_runtime_->context, layer.host_weights));
+            state.biases = std::make_unique<GpuBuffer>(GpuBuffer::from_host(gpu_runtime_->context, layer.host_biases));
+            state.grad_weights = std::make_unique<GpuBuffer>(make_zero_buffer(gpu_runtime_->context, layer.host_weights.size()));
+            state.grad_biases = std::make_unique<GpuBuffer>(make_zero_buffer(gpu_runtime_->context, layer.host_biases.size()));
+
+            state.velocity_weights = std::make_unique<GpuBuffer>(make_zero_buffer(gpu_runtime_->context, layer.host_weights.size()));
+            state.velocity_biases = std::make_unique<GpuBuffer>(make_zero_buffer(gpu_runtime_->context, layer.host_biases.size()));
+            state.adam_m_weights = std::make_unique<GpuBuffer>(make_zero_buffer(gpu_runtime_->context, layer.host_weights.size()));
+            state.adam_v_weights = std::make_unique<GpuBuffer>(make_zero_buffer(gpu_runtime_->context, layer.host_weights.size()));
+            state.adam_m_biases = std::make_unique<GpuBuffer>(make_zero_buffer(gpu_runtime_->context, layer.host_biases.size()));
+            state.adam_v_biases = std::make_unique<GpuBuffer>(make_zero_buffer(gpu_runtime_->context, layer.host_biases.size()));
+        }
+        gpu_runtime_->parameters_synced = true;
+    }
+
+    ForwardCache cache;
+    cache.op_inputs.reserve(operations_.size());
+    cache.op_outputs.reserve(operations_.size());
+
+    std::vector<float> current = input;
+    std::size_t linear_index = 0;
+
+    for (const auto &op : operations_) {
+        cache.op_inputs.push_back(current);
+
+        if (op.type == OperationType::Linear) {
+            if (linear_index >= layers_.size()) {
+                throw std::runtime_error("Internal linear layer index out of range");
+            }
+
+            const DenseLayer &layer = layers_[linear_index++];
+            if (current.size() != layer.input_size) {
+                throw std::invalid_argument("Input size mismatch for linear operation");
+            }
+
+            auto &device_state = gpu_runtime_->layer_states[linear_index - 1];
+
+            GpuBuffer input_buf = GpuBuffer::from_host(gpu_runtime_->context, current);
+            GpuBuffer output = GpuBuffer::allocate(gpu_runtime_->context, layer.output_size * sizeof(float));
+
+            GpuKernel dense_kernel(gpu_runtime_->program, "dense_forward", gpu_runtime_->context);
+            std::vector<KernelArg> args = {
+                KernelArg::buffer(device_state.weights->get_buffer()),
+                KernelArg::buffer(device_state.biases->get_buffer()),
+                KernelArg::buffer(input_buf.get_buffer()),
+                KernelArg::buffer(output.get_buffer()),
+                KernelArg::scalar_uint(static_cast<uint32_t>(layer.input_size)),
+            };
+            dense_kernel.set_args(args);
+            dense_kernel.enqueue_1d(layer.output_size);
+
+            current = output.to_host<float>();
+        } else {
+            GpuBuffer values = GpuBuffer::from_host(gpu_runtime_->context, current);
+            const char *kernel_name = nullptr;
+            if (op.type == OperationType::Relu) {
+                kernel_name = "relu_activation";
+            } else if (op.type == OperationType::Sigmoid) {
+                kernel_name = "sigmoid_activation";
+            } else if (op.type == OperationType::Tanh) {
+                kernel_name = "tanh_activation";
+            } else if (op.type == OperationType::LeakyRelu) {
+                kernel_name = "leaky_relu_activation";
+            } else if (op.type == OperationType::Gelu) {
+                kernel_name = "gelu_activation";
+            }
+
+            if (kernel_name != nullptr) {
+                GpuKernel act_kernel(gpu_runtime_->program, kernel_name, gpu_runtime_->context);
+                act_kernel.set_args({KernelArg::buffer(values.get_buffer())});
+                act_kernel.enqueue_1d(current.size());
+                current = values.to_host<float>();
+            }
+        }
+
+        cache.op_outputs.push_back(current);
+    }
+
+    return cache;
+}
+
+std::vector<float> MlpNetwork::forward_gpu(const std::vector<float> &input) const {
+    const ForwardCache cache = forward_with_cache_gpu(input);
+    if (cache.op_outputs.empty()) {
+        throw std::runtime_error("Forward cache is empty");
+    }
+    return cache.op_outputs.back();
+}
+
 std::vector<float> MlpNetwork::forward(const std::vector<float> &input) {
+    if (execution_backend_ == ExecutionBackend::GPU) {
+        return forward_gpu(input);
+    }
     return forward_cpu(input);
 }
 
@@ -463,7 +644,26 @@ float MlpNetwork::evaluate_cost_cpu(const ManufacturingDefectDataset &dataset, L
 }
 
 float MlpNetwork::evaluate_cost(const ManufacturingDefectDataset &dataset, LossType loss_type) const {
+    if (execution_backend_ == ExecutionBackend::GPU) {
+        return evaluate_cost_gpu(dataset, loss_type);
+    }
     return evaluate_cost_cpu(dataset, loss_type);
+}
+
+float MlpNetwork::evaluate_cost_gpu(const ManufacturingDefectDataset &dataset, LossType loss_type) const {
+    if (dataset.size() == 0) {
+        throw std::invalid_argument("Dataset is empty");
+    }
+
+    float total_loss = 0.0f;
+    for (const auto &sample : dataset.samples()) {
+        const std::vector<float> prediction = forward_gpu(sample.features);
+        const float y_hat = prediction.empty() ? 0.0f : prediction[0];
+        const float y = static_cast<float>(sample.label);
+        total_loss += compute_loss(y_hat, y, loss_type, positive_class_weight_, negative_class_weight_);
+    }
+
+    return total_loss / static_cast<float>(dataset.size());
 }
 
 float MlpNetwork::train_one_epoch_internal(const ManufacturingDefectDataset &dataset,
@@ -651,6 +851,7 @@ float MlpNetwork::train_one_epoch_internal(const ManufacturingDefectDataset &dat
 
     }
 
+    invalidate_gpu_parameter_cache();
     return total_loss / static_cast<float>(dataset.size());
 }
 
@@ -662,11 +863,292 @@ float MlpNetwork::train_one_epoch_cpu(const ManufacturingDefectDataset &dataset,
     return train_one_epoch_internal(dataset, learning_rate, loss_type, batch_size);
 }
 
+void MlpNetwork::backward_update_gpu(const ForwardCache &cache,
+                                     float target,
+                                     float learning_rate,
+                                     LossType loss_type)
+{
+    (void)learning_rate;
+    ensure_gpu_runtime();
+    if (cache.op_outputs.empty()) {
+        throw std::runtime_error("Forward cache is empty");
+    }
+
+    const std::vector<float> &network_output = cache.op_outputs.back();
+    if (network_output.size() != 1) {
+        throw std::runtime_error("Current GPU training path expects a single output unit");
+    }
+
+    const bool use_bce_sigmoid_shortcut = should_use_bce_sigmoid_shortcut(loss_type);
+    std::vector<float> gradient(network_output.size(), 0.0f);
+    gradient[0] = SgdOptimizer::output_gradient(
+        network_output[0],
+        target,
+        loss_type,
+        use_bce_sigmoid_shortcut,
+        positive_class_weight_,
+        negative_class_weight_,
+        loss_derivative_wrt_prediction);
+
+    std::size_t reverse_linear_index = layers_.size();
+
+    for (std::size_t op_index = operations_.size(); op_index-- > 0;) {
+        const OperationType op_type = operations_[op_index].type;
+        const std::vector<float> &op_input = cache.op_inputs[op_index];
+        const std::vector<float> &op_output = cache.op_outputs[op_index];
+
+        if (op_type == OperationType::Relu ||
+            op_type == OperationType::Sigmoid ||
+            op_type == OperationType::Tanh ||
+            op_type == OperationType::LeakyRelu ||
+            op_type == OperationType::Gelu) {
+            const bool skip_output_sigmoid_derivative =
+                use_bce_sigmoid_shortcut &&
+                op_type == OperationType::Sigmoid &&
+                op_index + 1 == operations_.size();
+            if (skip_output_sigmoid_derivative) {
+                continue;
+            }
+
+            if (gradient.size() != op_output.size()) {
+                throw std::runtime_error("Gradient size mismatch in activation backward pass");
+            }
+
+            GpuBuffer grad_buf = GpuBuffer::from_host(gpu_runtime_->context, gradient);
+            GpuBuffer deriv_buf = GpuBuffer::allocate(gpu_runtime_->context, gradient.size() * sizeof(float));
+            const std::vector<float> *source = &op_output;
+            const char *deriv_kernel_name = nullptr;
+            if (op_type == OperationType::Relu) {
+                deriv_kernel_name = "relu_derivative";
+            } else if (op_type == OperationType::Sigmoid) {
+                deriv_kernel_name = "sigmoid_derivative";
+            } else if (op_type == OperationType::Tanh) {
+                deriv_kernel_name = "tanh_derivative";
+            } else if (op_type == OperationType::LeakyRelu) {
+                deriv_kernel_name = "leaky_relu_derivative";
+            } else if (op_type == OperationType::Gelu) {
+                deriv_kernel_name = "gelu_derivative";
+                source = &op_input;
+            }
+
+            GpuBuffer source_buf = GpuBuffer::from_host(gpu_runtime_->context, *source);
+            GpuKernel deriv_kernel(gpu_runtime_->program, deriv_kernel_name, gpu_runtime_->context);
+            deriv_kernel.set_args({
+                KernelArg::buffer(source_buf.get_buffer()),
+                KernelArg::buffer(deriv_buf.get_buffer()),
+            });
+            deriv_kernel.enqueue_1d(gradient.size());
+
+            GpuKernel mul_kernel(gpu_runtime_->program, "elementwise_multiply_inplace", gpu_runtime_->context);
+            mul_kernel.set_args({
+                KernelArg::buffer(grad_buf.get_buffer()),
+                KernelArg::buffer(deriv_buf.get_buffer()),
+            });
+            mul_kernel.enqueue_1d(gradient.size());
+
+            gradient = grad_buf.to_host<float>();
+            continue;
+        }
+
+        if (reverse_linear_index == 0) {
+            throw std::runtime_error("Internal linear layer reverse index out of range");
+        }
+
+        DenseLayer &layer = layers_[--reverse_linear_index];
+        if (gradient.size() != layer.output_size || op_input.size() != layer.input_size) {
+            throw std::runtime_error("Gradient/input size mismatch in linear backward pass");
+        }
+
+        auto &device_state = gpu_runtime_->layer_states[reverse_linear_index];
+        if (!device_state.weights || !device_state.biases || !device_state.grad_weights || !device_state.grad_biases) {
+            throw std::runtime_error("GPU layer state is not initialized");
+        }
+
+        GpuBuffer input_buf = GpuBuffer::from_host(gpu_runtime_->context, op_input);
+        GpuBuffer grad_output_buf = GpuBuffer::from_host(gpu_runtime_->context, gradient);
+        GpuBuffer grad_input_buf = GpuBuffer::allocate(gpu_runtime_->context, layer.input_size * sizeof(float));
+
+        GpuKernel grad_input_kernel(gpu_runtime_->program, "dense_backward_input", gpu_runtime_->context);
+        grad_input_kernel.set_args({
+            KernelArg::buffer(device_state.weights->get_buffer()),
+            KernelArg::buffer(grad_output_buf.get_buffer()),
+            KernelArg::buffer(grad_input_buf.get_buffer()),
+            KernelArg::scalar_uint(static_cast<uint32_t>(layer.input_size)),
+            KernelArg::scalar_uint(static_cast<uint32_t>(layer.output_size)),
+        });
+        grad_input_kernel.enqueue_1d(layer.input_size);
+
+        GpuKernel accumulate_kernel(gpu_runtime_->program, "dense_accumulate_grads", gpu_runtime_->context);
+        accumulate_kernel.set_args({
+            KernelArg::buffer(device_state.grad_weights->get_buffer()),
+            KernelArg::buffer(device_state.grad_biases->get_buffer()),
+            KernelArg::buffer(input_buf.get_buffer()),
+            KernelArg::buffer(grad_output_buf.get_buffer()),
+            KernelArg::scalar_uint(static_cast<uint32_t>(layer.input_size)),
+        });
+        accumulate_kernel.enqueue_1d(layer.output_size);
+
+        gradient = grad_input_buf.to_host<float>();
+    }
+}
+
+float MlpNetwork::train_one_epoch_internal_gpu(const ManufacturingDefectDataset &dataset,
+                                               float learning_rate,
+                                               LossType loss_type,
+                                               std::size_t batch_size)
+{
+    if (dataset.size() == 0) {
+        throw std::invalid_argument("Dataset is empty");
+    }
+    if (learning_rate <= 0.0f) {
+        throw std::invalid_argument("Learning rate must be positive");
+    }
+    if (batch_size == 0) {
+        throw std::invalid_argument("Batch size must be positive");
+    }
+
+    ensure_gpu_runtime();
+    if (gpu_runtime_ == nullptr) {
+        throw std::runtime_error("Failed to initialize GPU runtime");
+    }
+
+    float total_loss = 0.0f;
+    std::vector<std::size_t> sample_indices(dataset.size());
+    std::iota(sample_indices.begin(), sample_indices.end(), 0);
+    static std::mt19937 rng(42u);
+    std::shuffle(sample_indices.begin(), sample_indices.end(), rng);
+
+    if (gpu_runtime_->layer_states.size() != layers_.size() || !gpu_runtime_->parameters_synced) {
+        const DefectSample &warmup_sample = dataset.sample(sample_indices.front());
+        (void)forward_with_cache_gpu(warmup_sample.features);
+    }
+
+    auto clear_batch_gradients = [&]() {
+        for (std::size_t layer_idx = 0; layer_idx < layers_.size(); ++layer_idx) {
+            const DenseLayer &layer = layers_[layer_idx];
+            auto &state = gpu_runtime_->layer_states[layer_idx];
+            enqueue_fill_float(gpu_runtime_->context,
+                               gpu_runtime_->program,
+                               *state.grad_weights,
+                               0.0f,
+                               layer.host_weights.size());
+            enqueue_fill_float(gpu_runtime_->context,
+                               gpu_runtime_->program,
+                               *state.grad_biases,
+                               0.0f,
+                               layer.host_biases.size());
+        }
+    };
+
+    auto apply_optimizer_update = [&](std::size_t actual_batch_size) {
+        const float inv_batch = 1.0f / static_cast<float>(actual_batch_size);
+        const std::uint64_t next_step = optimizer_step_ + 1;
+        const float beta1_pow = pow_uint(adam_beta1_, next_step);
+        const float beta2_pow = pow_uint(adam_beta2_, next_step);
+        const float bias_corr1 = 1.0f - beta1_pow;
+        const float bias_corr2 = 1.0f - beta2_pow;
+
+        for (std::size_t layer_idx = 0; layer_idx < layers_.size(); ++layer_idx) {
+            const DenseLayer &layer = layers_[layer_idx];
+            auto &state = gpu_runtime_->layer_states[layer_idx];
+
+            if (optimizer_type_ == OptimizerType::SGD) {
+                GpuKernel update_kernel(gpu_runtime_->program, "dense_sgd_update", gpu_runtime_->context);
+                update_kernel.set_args({
+                    KernelArg::buffer(state.weights->get_buffer()),
+                    KernelArg::buffer(state.biases->get_buffer()),
+                    KernelArg::buffer(state.grad_weights->get_buffer()),
+                    KernelArg::buffer(state.grad_biases->get_buffer()),
+                    KernelArg::scalar_float(learning_rate),
+                    KernelArg::scalar_float(inv_batch),
+                    KernelArg::scalar_uint(static_cast<uint32_t>(layer.input_size)),
+                });
+                update_kernel.enqueue_1d(layer.output_size);
+            } else if (optimizer_type_ == OptimizerType::Momentum) {
+                GpuKernel update_kernel(gpu_runtime_->program, "dense_momentum_update", gpu_runtime_->context);
+                update_kernel.set_args({
+                    KernelArg::buffer(state.weights->get_buffer()),
+                    KernelArg::buffer(state.biases->get_buffer()),
+                    KernelArg::buffer(state.velocity_weights->get_buffer()),
+                    KernelArg::buffer(state.velocity_biases->get_buffer()),
+                    KernelArg::buffer(state.grad_weights->get_buffer()),
+                    KernelArg::buffer(state.grad_biases->get_buffer()),
+                    KernelArg::scalar_float(learning_rate),
+                    KernelArg::scalar_float(momentum_),
+                    KernelArg::scalar_float(inv_batch),
+                    KernelArg::scalar_uint(static_cast<uint32_t>(layer.input_size)),
+                });
+                update_kernel.enqueue_1d(layer.output_size);
+            } else {
+                GpuKernel update_kernel(gpu_runtime_->program, "dense_adam_update", gpu_runtime_->context);
+                update_kernel.set_args({
+                    KernelArg::buffer(state.weights->get_buffer()),
+                    KernelArg::buffer(state.biases->get_buffer()),
+                    KernelArg::buffer(state.adam_m_weights->get_buffer()),
+                    KernelArg::buffer(state.adam_v_weights->get_buffer()),
+                    KernelArg::buffer(state.adam_m_biases->get_buffer()),
+                    KernelArg::buffer(state.adam_v_biases->get_buffer()),
+                    KernelArg::buffer(state.grad_weights->get_buffer()),
+                    KernelArg::buffer(state.grad_biases->get_buffer()),
+                    KernelArg::scalar_float(learning_rate),
+                    KernelArg::scalar_float(adam_beta1_),
+                    KernelArg::scalar_float(adam_beta2_),
+                    KernelArg::scalar_float(adam_epsilon_),
+                    KernelArg::scalar_float(bias_corr1),
+                    KernelArg::scalar_float(bias_corr2),
+                    KernelArg::scalar_float(inv_batch),
+                    KernelArg::scalar_uint(static_cast<uint32_t>(layer.input_size)),
+                });
+                update_kernel.enqueue_1d(layer.output_size);
+            }
+        }
+        optimizer_step_ = next_step;
+    };
+
+    for (std::size_t begin = 0; begin < sample_indices.size(); begin += batch_size) {
+        const std::size_t end = std::min(begin + batch_size, sample_indices.size());
+        const std::size_t current_batch_size = end - begin;
+
+        clear_batch_gradients();
+
+        for (std::size_t pos = begin; pos < end; ++pos) {
+            const DefectSample &sample = dataset.sample(sample_indices[pos]);
+            const ForwardCache cache = forward_with_cache_gpu(sample.features);
+            const std::vector<float> &current = cache.op_outputs.back();
+            if (current.empty()) {
+                throw std::runtime_error("Network output is empty");
+            }
+
+            const float target = static_cast<float>(sample.label);
+            total_loss += compute_loss(current[0], target, loss_type, positive_class_weight_, negative_class_weight_);
+            backward_update_gpu(cache, target, learning_rate, loss_type);
+        }
+
+        apply_optimizer_update(current_batch_size);
+    }
+
+    gpu_runtime_->context.get_queue().finish();
+    sync_gpu_layers_to_host();
+
+    return total_loss / static_cast<float>(dataset.size());
+}
+
+float MlpNetwork::train_one_epoch_gpu(const ManufacturingDefectDataset &dataset,
+                                      float learning_rate,
+                                      LossType loss_type,
+                                      std::size_t batch_size)
+{
+    return train_one_epoch_internal_gpu(dataset, learning_rate, loss_type, batch_size);
+}
+
 float MlpNetwork::train_one_epoch(const ManufacturingDefectDataset &dataset,
                                   float learning_rate,
                                   LossType loss_type,
                                   std::size_t batch_size)
 {
+    if (execution_backend_ == ExecutionBackend::GPU) {
+        return train_one_epoch_gpu(dataset, learning_rate, loss_type, batch_size);
+    }
     return train_one_epoch_cpu(dataset, learning_rate, loss_type, batch_size);
 }
 
@@ -821,4 +1303,8 @@ void MlpNetwork::load_from_file(const std::filesystem::path &model_path) {
         }
     }
 
+    invalidate_gpu_parameter_cache();
+
 }
+
+MlpNetwork::~MlpNetwork() = default;

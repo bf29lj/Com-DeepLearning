@@ -168,6 +168,34 @@ constexpr const char *MATH_KERNEL_SOURCE = R"CLC(
         values[idx] *= factors[idx];
     }
 
+    __kernel void fill_float(
+        __global float *values,
+        const float value,
+        const uint n)
+    {
+        const uint idx = get_global_id(0);
+        if (idx < n) {
+            values[idx] = value;
+        }
+    }
+
+    __kernel void dense_accumulate_grads(
+        __global float *grad_weights,
+        __global float *grad_biases,
+        __global const float *input,
+        __global const float *grad_output,
+        const uint input_size)
+    {
+        const uint out = get_global_id(0);
+        const float delta = grad_output[out];
+        grad_biases[out] += delta;
+
+        const uint offset = out * input_size;
+        for (uint in = 0; in < input_size; ++in) {
+            grad_weights[offset + in] += delta * input[in];
+        }
+    }
+
     __kernel void dense_backward_input(
         __global const float *weights,
         __global const float *grad_output,
@@ -186,18 +214,88 @@ constexpr const char *MATH_KERNEL_SOURCE = R"CLC(
     __kernel void dense_sgd_update(
         __global float *weights,
         __global float *biases,
-        __global const float *input,
-        __global const float *grad_output,
+        __global const float *grad_weights,
+        __global const float *grad_biases,
         const float learning_rate,
+        const float inv_batch,
         const uint input_size)
     {
         const uint out = get_global_id(0);
-        const float delta = grad_output[out];
+        const float delta = grad_biases[out] * inv_batch;
         biases[out] -= learning_rate * delta;
 
         const uint offset = out * input_size;
         for (uint in = 0; in < input_size; ++in) {
-            weights[offset + in] -= learning_rate * delta * input[in];
+            const float g = grad_weights[offset + in] * inv_batch;
+            weights[offset + in] -= learning_rate * g;
+        }
+    }
+
+    __kernel void dense_momentum_update(
+        __global float *weights,
+        __global float *biases,
+        __global float *velocity_weights,
+        __global float *velocity_biases,
+        __global const float *grad_weights,
+        __global const float *grad_biases,
+        const float learning_rate,
+        const float momentum,
+        const float inv_batch,
+        const uint input_size)
+    {
+        const uint out = get_global_id(0);
+        const float grad_b = grad_biases[out] * inv_batch;
+        velocity_biases[out] = momentum * velocity_biases[out] - learning_rate * grad_b;
+        biases[out] += velocity_biases[out];
+
+        const uint offset = out * input_size;
+        for (uint in = 0; in < input_size; ++in) {
+            const float grad_w = grad_weights[offset + in] * inv_batch;
+            velocity_weights[offset + in] =
+                momentum * velocity_weights[offset + in] - learning_rate * grad_w;
+            weights[offset + in] += velocity_weights[offset + in];
+        }
+    }
+
+    __kernel void dense_adam_update(
+        __global float *weights,
+        __global float *biases,
+        __global float *adam_m_weights,
+        __global float *adam_v_weights,
+        __global float *adam_m_biases,
+        __global float *adam_v_biases,
+        __global const float *grad_weights,
+        __global const float *grad_biases,
+        const float learning_rate,
+        const float beta1,
+        const float beta2,
+        const float epsilon,
+        const float bias_corr1,
+        const float bias_corr2,
+        const float inv_batch,
+        const uint input_size)
+    {
+        const uint out = get_global_id(0);
+
+        const float grad_b = grad_biases[out] * inv_batch;
+        const float m_b = beta1 * adam_m_biases[out] + (1.0f - beta1) * grad_b;
+        const float v_b = beta2 * adam_v_biases[out] + (1.0f - beta2) * grad_b * grad_b;
+        adam_m_biases[out] = m_b;
+        adam_v_biases[out] = v_b;
+        const float m_hat_b = m_b / bias_corr1;
+        const float v_hat_b = v_b / bias_corr2;
+        biases[out] -= learning_rate * m_hat_b / (sqrt(v_hat_b) + epsilon);
+
+        const uint offset = out * input_size;
+        for (uint in = 0; in < input_size; ++in) {
+            const float grad_w = grad_weights[offset + in] * inv_batch;
+            const float m_w = beta1 * adam_m_weights[offset + in] + (1.0f - beta1) * grad_w;
+            const float v_w = beta2 * adam_v_weights[offset + in] + (1.0f - beta2) * grad_w * grad_w;
+            adam_m_weights[offset + in] = m_w;
+            adam_v_weights[offset + in] = v_w;
+            const float m_hat_w = m_w / bias_corr1;
+            const float v_hat_w = v_w / bias_corr2;
+            weights[offset + in] -= learning_rate * m_hat_w / (sqrt(v_hat_w) + epsilon);
         }
     }
 )CLC";

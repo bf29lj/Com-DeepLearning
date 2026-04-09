@@ -260,8 +260,8 @@ TrainingConfig parse_args(int argc, char **argv) {
         throw std::invalid_argument("Hidden activation cannot be linear");
     }
 
-    if (cfg.backend == ExecutionBackend::GPU) {
-        throw std::invalid_argument("GPU backend is still under development. Please use --backend cpu.");
+    if (cfg.backend == ExecutionBackend::GPU && cfg.model_type == "lstm") {
+        throw std::invalid_argument("LSTM GPU backend is still under development. Please use --backend cpu for --model lstm.");
     }
 
     if (cfg.learning_rate <= 0.0f || !std::isfinite(cfg.learning_rate)) {

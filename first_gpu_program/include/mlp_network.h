@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -91,6 +92,7 @@ public:
 
     // Preferred constructor: explicit operation pipeline definition.
     MlpNetwork(std::vector<OperationConfig> operations);
+    ~MlpNetwork();
 
     // Stores the requested execution backend for compatibility.
     void set_execution_backend(ExecutionBackend backend) { execution_backend_ = backend; }
@@ -109,6 +111,7 @@ public:
     // Runs a single 1D forward pass on the CPU.
     std::vector<float> forward(const std::vector<float> &input);
     std::vector<float> forward_cpu(const std::vector<float> &input) const;
+    std::vector<float> forward_gpu(const std::vector<float> &input) const;
 
     // Trains one epoch on the CPU and returns average epoch loss.
     float train_one_epoch(const ManufacturingDefectDataset &dataset,
@@ -119,11 +122,17 @@ public:
                               float learning_rate,
                               LossType loss_type,
                               std::size_t batch_size = 1);
+    float train_one_epoch_gpu(const ManufacturingDefectDataset &dataset,
+                              float learning_rate,
+                              LossType loss_type,
+                              std::size_t batch_size = 1);
 
     // Evaluates average loss over a dataset on the CPU.
     float evaluate_cost(const ManufacturingDefectDataset &dataset,
                         LossType loss_type) const;
     float evaluate_cost_cpu(const ManufacturingDefectDataset &dataset,
+                            LossType loss_type) const;
+    float evaluate_cost_gpu(const ManufacturingDefectDataset &dataset,
                             LossType loss_type) const;
 
     // Returns the configured operation pipeline.
@@ -182,14 +191,26 @@ private:
         const std::vector<std::size_t> &layer_sizes);
     void initialize_layer(DenseLayer &layer, OperationType next_op_type);
     ForwardCache forward_with_cache_cpu(const std::vector<float> &input) const;
+    ForwardCache forward_with_cache_gpu(const std::vector<float> &input) const;
     float train_one_epoch_internal(const ManufacturingDefectDataset &dataset,
                                    float learning_rate,
                                    LossType loss_type,
                                    std::size_t batch_size);
+    float train_one_epoch_internal_gpu(const ManufacturingDefectDataset &dataset,
+                                       float learning_rate,
+                                       LossType loss_type,
+                                       std::size_t batch_size);
     void backward_update_cpu(const ForwardCache &cache,
                              float target,
                              float learning_rate,
                              LossType loss_type);
+    void backward_update_gpu(const ForwardCache &cache,
+                             float target,
+                             float learning_rate,
+                             LossType loss_type);
+    void ensure_gpu_runtime() const;
+    void sync_gpu_layers_to_host();
+    void invalidate_gpu_parameter_cache();
     static float compute_loss(float prediction,
                               float target,
                               LossType loss_type,
@@ -207,6 +228,8 @@ private:
     std::vector<OperationConfig> operations_;
     std::vector<DenseLayer> layers_;
     std::vector<OptimizerState> optimizer_states_;
+    struct GpuRuntimeImpl;
+    mutable std::unique_ptr<GpuRuntimeImpl> gpu_runtime_;
     ExecutionBackend execution_backend_ = ExecutionBackend::CPU;
     OptimizerType optimizer_type_ = OptimizerType::SGD;
     float momentum_ = 0.9f;
