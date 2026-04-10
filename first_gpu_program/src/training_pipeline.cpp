@@ -26,6 +26,8 @@ const char *optimizer_name(OptimizerType optimizer) {
             return "Momentum";
         case OptimizerType::Adam:
             return "Adam";
+        case OptimizerType::AdamW:
+            return "AdamW";
     }
     return "Unknown";
 }
@@ -394,6 +396,7 @@ TrainingRunResult run_lstm_pipeline(const TrainingConfig &config,
         config.adam_beta1,
         config.adam_beta2,
         config.adam_epsilon);
+    network.set_weight_decay(config.weight_decay);
     network.set_focal_parameters(config.focal_gamma, config.focal_alpha);
 
     if (!config.load_model_path.empty()) {
@@ -418,6 +421,11 @@ TrainingRunResult run_lstm_pipeline(const TrainingConfig &config,
         std::cout << "Adam betas: beta1=" << config.adam_beta1
                   << ", beta2=" << config.adam_beta2
                   << ", epsilon=" << config.adam_epsilon << std::endl;
+    } else if (config.optimizer == OptimizerType::AdamW) {
+        std::cout << "AdamW params: beta1=" << config.adam_beta1
+                  << ", beta2=" << config.adam_beta2
+                  << ", epsilon=" << config.adam_epsilon
+                  << ", weight_decay=" << config.weight_decay << std::endl;
     }
     std::cout << "Execution backend: " << backend_name(config.backend) << std::endl;
     std::cout << "Learning rate: " << config.learning_rate << std::endl;
@@ -619,6 +627,7 @@ TrainingRunResult run_training_pipeline(const TrainingConfig &config,
         config.adam_beta1,
         config.adam_beta2,
         config.adam_epsilon);
+    network.set_weight_decay(config.weight_decay);
     network.set_focal_parameters(config.focal_gamma, config.focal_alpha);
 
     if (!config.load_model_path.empty()) {
@@ -642,6 +651,11 @@ TrainingRunResult run_training_pipeline(const TrainingConfig &config,
         std::cout << "Adam betas: beta1=" << config.adam_beta1
                   << ", beta2=" << config.adam_beta2
                   << ", epsilon=" << config.adam_epsilon << std::endl;
+    } else if (config.optimizer == OptimizerType::AdamW) {
+        std::cout << "AdamW params: beta1=" << config.adam_beta1
+                  << ", beta2=" << config.adam_beta2
+                  << ", epsilon=" << config.adam_epsilon
+                  << ", weight_decay=" << config.weight_decay << std::endl;
     }
     std::cout << "Execution backend: " << backend_name(config.backend) << std::endl;
     std::cout << "Hidden activation: " << activation_name(config.hidden_activation) << std::endl;

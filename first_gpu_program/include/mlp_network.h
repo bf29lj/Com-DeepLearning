@@ -33,6 +33,7 @@ enum class OptimizerType {
     SGD,
     Momentum,
     Adam,
+    AdamW,
 };
 
 // 1D operation kinds in a configurable forward pipeline.
@@ -103,6 +104,8 @@ public:
     void set_optimizer_type(OptimizerType optimizer_type) { optimizer_type_ = optimizer_type; }
     OptimizerType optimizer_type() const { return optimizer_type_; }
     void set_optimizer_hyperparameters(float momentum, float adam_beta1, float adam_beta2, float adam_epsilon);
+    void set_weight_decay(float weight_decay);
+    float weight_decay() const { return weight_decay_; }
     void set_enable_bce_sigmoid_shortcut(bool enable) { enable_bce_sigmoid_shortcut_ = enable; }
     bool enable_bce_sigmoid_shortcut() const { return enable_bce_sigmoid_shortcut_; }
     void set_class_weights(float positive_weight, float negative_weight);
@@ -244,6 +247,7 @@ private:
     float adam_beta1_ = 0.9f;
     float adam_beta2_ = 0.999f;
     float adam_epsilon_ = 1e-8f;
+    float weight_decay_ = 0.0f;
     std::uint64_t optimizer_step_ = 0;
     bool enable_bce_sigmoid_shortcut_ = true;
     float positive_class_weight_ = 1.0f;

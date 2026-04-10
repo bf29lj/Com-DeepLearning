@@ -119,6 +119,8 @@ public:
     // Copy to host
     void copy_to_host(void *host_ptr, size_t bytes);
     void copy_to_host_offset(void *host_ptr, size_t bytes, size_t offset_bytes);
+    void copy_to_host_async(void *host_ptr, size_t bytes);
+    void copy_to_host_offset_async(void *host_ptr, size_t bytes, size_t offset_bytes);
 
     template <typename T>
     std::vector<T> to_host() {
@@ -131,6 +133,7 @@ public:
 
     // Copy from host
     void copy_from_host(const void *host_ptr, size_t bytes);
+    void copy_from_host_async(const void *host_ptr, size_t bytes);
 
     // Get underlying compute::buffer for kernel setup
     compute::buffer &get_buffer() {

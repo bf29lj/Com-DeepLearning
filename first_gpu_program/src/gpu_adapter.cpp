@@ -80,19 +80,28 @@ GpuBuffer GpuBuffer::allocate(const GpuContext &ctx, size_t element_count) {
 }
 
 void GpuBuffer::copy_to_host(void *host_ptr, size_t bytes) {
+    copy_to_host_async(host_ptr, bytes);
+    context_->get_queue().finish();
+}
+
+void GpuBuffer::copy_to_host_async(void *host_ptr, size_t bytes) {
     if (bytes > element_count_) {
         throw GpuException("Copy size exceeds buffer capacity");
     }
     try {
         compute::copy(vec_->begin(), vec_->begin() + bytes,
                       static_cast<uint8_t *>(host_ptr), context_->get_queue());
-        context_->get_queue().finish();
     } catch (const std::exception &e) {
         throw GpuException(std::string("Failed to copy buffer to host: ") + e.what());
     }
 }
 
 void GpuBuffer::copy_from_host(const void *host_ptr, size_t bytes) {
+    copy_from_host_async(host_ptr, bytes);
+    context_->get_queue().finish();
+}
+
+void GpuBuffer::copy_from_host_async(const void *host_ptr, size_t bytes) {
     if (bytes > element_count_) {
         throw GpuException("Copy size exceeds buffer capacity");
     }
@@ -100,13 +109,17 @@ void GpuBuffer::copy_from_host(const void *host_ptr, size_t bytes) {
         compute::copy(static_cast<const uint8_t *>(host_ptr),
                       static_cast<const uint8_t *>(host_ptr) + bytes,
                       vec_->begin(), context_->get_queue());
-        context_->get_queue().finish();
     } catch (const std::exception &e) {
         throw GpuException(std::string("Failed to copy buffer from host: ") + e.what());
     }
 }
 
 void GpuBuffer::copy_to_host_offset(void *host_ptr, size_t bytes, size_t offset_bytes) {
+    copy_to_host_offset_async(host_ptr, bytes, offset_bytes);
+    context_->get_queue().finish();
+}
+
+void GpuBuffer::copy_to_host_offset_async(void *host_ptr, size_t bytes, size_t offset_bytes) {
     if (offset_bytes + bytes > element_count_) {
         throw GpuException("Copy range exceeds buffer capacity");
     }
@@ -114,7 +127,6 @@ void GpuBuffer::copy_to_host_offset(void *host_ptr, size_t bytes, size_t offset_
         compute::copy(vec_->begin() + static_cast<std::ptrdiff_t>(offset_bytes),
                       vec_->begin() + static_cast<std::ptrdiff_t>(offset_bytes + bytes),
                       static_cast<uint8_t *>(host_ptr), context_->get_queue());
-        context_->get_queue().finish();
     } catch (const std::exception &e) {
         throw GpuException(std::string("Failed to copy buffer range to host: ") + e.what());
     }

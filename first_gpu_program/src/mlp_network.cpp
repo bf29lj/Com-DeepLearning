@@ -114,6 +114,13 @@ void MlpNetwork::set_optimizer_hyperparameters(float momentum,
     adam_epsilon_ = adam_epsilon;
 }
 
+void MlpNetwork::set_weight_decay(float weight_decay) {
+    if (!std::isfinite(weight_decay) || weight_decay < 0.0f) {
+        throw std::invalid_argument("Weight decay must be a non-negative finite number");
+    }
+    weight_decay_ = weight_decay;
+}
+
 void MlpNetwork::SgdOptimizer::update_dense_layer(DenseLayer &layer,
                                                   const std::vector<float> &input,
                                                   const std::vector<float> &grad_output,
@@ -873,6 +880,14 @@ float MlpNetwork::train_one_epoch_internal(const ManufacturingDefectDataset &dat
                 } else if (optimizer_type_ == OptimizerType::Momentum) {
                     state.momentum_w[i] = momentum_ * state.momentum_w[i] - learning_rate * grad;
                     layer.host_weights[i] += state.momentum_w[i];
+                } else if (optimizer_type_ == OptimizerType::AdamW) {
+                    state.adam_m_w[i] = adam_beta1_ * state.adam_m_w[i] + (1.0f - adam_beta1_) * grad;
+                    state.adam_v_w[i] = adam_beta2_ * state.adam_v_w[i] + (1.0f - adam_beta2_) * grad * grad;
+                    const float m_hat = state.adam_m_w[i] / bias_corr1;
+                    const float v_hat = state.adam_v_w[i] / bias_corr2;
+                    const float weight_before = layer.host_weights[i];
+                    const float adam_step = m_hat / (std::sqrt(v_hat) + adam_epsilon_);
+                    layer.host_weights[i] = weight_before - learning_rate * (adam_step + weight_decay_ * weight_before);
                 } else {
                     state.adam_m_w[i] = adam_beta1_ * state.adam_m_w[i] + (1.0f - adam_beta1_) * grad;
                     state.adam_v_w[i] = adam_beta2_ * state.adam_v_w[i] + (1.0f - adam_beta2_) * grad * grad;
@@ -888,6 +903,12 @@ float MlpNetwork::train_one_epoch_internal(const ManufacturingDefectDataset &dat
                 } else if (optimizer_type_ == OptimizerType::Momentum) {
                     state.momentum_b[i] = momentum_ * state.momentum_b[i] - learning_rate * grad;
                     layer.host_biases[i] += state.momentum_b[i];
+                } else if (optimizer_type_ == OptimizerType::AdamW) {
+                    state.adam_m_b[i] = adam_beta1_ * state.adam_m_b[i] + (1.0f - adam_beta1_) * grad;
+                    state.adam_v_b[i] = adam_beta2_ * state.adam_v_b[i] + (1.0f - adam_beta2_) * grad * grad;
+                    const float m_hat = state.adam_m_b[i] / bias_corr1;
+                    const float v_hat = state.adam_v_b[i] / bias_corr2;
+                    layer.host_biases[i] -= learning_rate * m_hat / (std::sqrt(v_hat) + adam_epsilon_);
                 } else {
                     state.adam_m_b[i] = adam_beta1_ * state.adam_m_b[i] + (1.0f - adam_beta1_) * grad;
                     state.adam_v_b[i] = adam_beta2_ * state.adam_v_b[i] + (1.0f - adam_beta2_) * grad * grad;
@@ -1146,6 +1167,7 @@ float MlpNetwork::train_one_epoch_internal_gpu(const ManufacturingDefectDataset 
                     KernelArg::scalar_float(adam_beta1_),
                     KernelArg::scalar_float(adam_beta2_),
                     KernelArg::scalar_float(adam_epsilon_),
+                    KernelArg::scalar_float(weight_decay_),
                     KernelArg::scalar_float(bias_corr1),
                     KernelArg::scalar_float(bias_corr2),
                     KernelArg::scalar_float(inv_batch),

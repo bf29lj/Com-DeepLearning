@@ -278,6 +278,7 @@ constexpr const char *MATH_KERNEL_SOURCE = R"CLC(
         const float beta1,
         const float beta2,
         const float epsilon,
+        const float weight_decay,
         const float bias_corr1,
         const float bias_corr2,
         const float inv_batch,
@@ -296,6 +297,7 @@ constexpr const char *MATH_KERNEL_SOURCE = R"CLC(
 
         const uint offset = out * input_size;
         for (uint in = 0; in < input_size; ++in) {
+            const float weight_before = weights[offset + in];
             const float grad_w = grad_weights[offset + in] * inv_batch;
             const float m_w = beta1 * adam_m_weights[offset + in] + (1.0f - beta1) * grad_w;
             const float v_w = beta2 * adam_v_weights[offset + in] + (1.0f - beta2) * grad_w * grad_w;
@@ -303,7 +305,8 @@ constexpr const char *MATH_KERNEL_SOURCE = R"CLC(
             adam_v_weights[offset + in] = v_w;
             const float m_hat_w = m_w / bias_corr1;
             const float v_hat_w = v_w / bias_corr2;
-            weights[offset + in] -= learning_rate * m_hat_w / (sqrt(v_hat_w) + epsilon);
+            weights[offset + in] = weight_before - learning_rate * (
+                m_hat_w / (sqrt(v_hat_w) + epsilon) + weight_decay * weight_before);
         }
     }
 )CLC";

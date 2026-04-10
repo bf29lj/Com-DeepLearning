@@ -47,6 +47,7 @@ struct TrainingConfig {
     float adam_beta1 = 0.9f;
     float adam_beta2 = 0.999f;
     float adam_epsilon = 1e-8f;
+    float weight_decay = 0.0f;
     float lr_decay = 1.0f;
     std::size_t lr_decay_every = 1;
     float min_learning_rate = 0.0f;

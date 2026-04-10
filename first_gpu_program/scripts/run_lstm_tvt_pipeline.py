@@ -68,11 +68,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--focal-gamma", type=float, default=2.0)
     parser.add_argument("--focal-alpha", type=float, default=0.25)
     parser.add_argument("--lr", type=float, default=0.001)
-    parser.add_argument("--optimizer", type=str, default="sgd")
+    parser.add_argument("--optimizer", type=str, choices=["sgd", "momentum", "adam", "adamw"], default="sgd")
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--adam-beta1", type=float, default=0.9)
     parser.add_argument("--adam-beta2", type=float, default=0.999)
     parser.add_argument("--adam-eps", type=float, default=1e-8)
+    parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--lr-decay", type=float, default=1.0)
     parser.add_argument("--lr-decay-every", type=int, default=1)
     parser.add_argument("--min-lr", type=float, default=0.0)
@@ -527,6 +528,8 @@ def main() -> int:
             str(args.adam_beta2),
             "--adam-eps",
             str(args.adam_eps),
+            "--weight-decay",
+            str(args.weight_decay),
             "--lr-decay",
             str(args.lr_decay),
             "--lr-decay-every",
@@ -646,6 +649,8 @@ def main() -> int:
                 str(args.adam_beta2),
                 "--adam-eps",
                 str(args.adam_eps),
+                "--weight-decay",
+                str(args.weight_decay),
                 "--lr-decay",
                 str(args.lr_decay),
                 "--lr-decay-every",
@@ -711,6 +716,8 @@ def main() -> int:
                 str(args.adam_beta2),
                 "--adam-eps",
                 str(args.adam_eps),
+                "--weight-decay",
+                str(args.weight_decay),
                 "--lr-decay",
                 str(args.lr_decay),
                 "--lr-decay-every",
@@ -772,6 +779,8 @@ def main() -> int:
                 str(args.adam_beta2),
                 "--adam-eps",
                 str(args.adam_eps),
+                "--weight-decay",
+                str(args.weight_decay),
                 "--lr-decay",
                 str(args.lr_decay),
                 "--lr-decay-every",

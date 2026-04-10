@@ -91,6 +91,7 @@ void enqueue_lstm_gate_update(GpuContext &context,
                               float adam_beta1,
                               float adam_beta2,
                               float adam_epsilon,
+                              float weight_decay,
                               float bias_corr1,
                               float bias_corr2,
                               float inv_batch,
@@ -144,6 +145,7 @@ void enqueue_lstm_gate_update(GpuContext &context,
         KernelArg::scalar_float(adam_beta1),
         KernelArg::scalar_float(adam_beta2),
         KernelArg::scalar_float(adam_epsilon),
+        KernelArg::scalar_float(weight_decay),
         KernelArg::scalar_float(bias_corr1),
         KernelArg::scalar_float(bias_corr2),
         KernelArg::scalar_float(inv_batch),
@@ -345,6 +347,13 @@ void LstmNetwork::set_optimizer_hyperparameters(float momentum,
     adam_beta1_ = adam_beta1;
     adam_beta2_ = adam_beta2;
     adam_epsilon_ = adam_epsilon;
+}
+
+void LstmNetwork::set_weight_decay(float weight_decay) {
+    if (!std::isfinite(weight_decay) || weight_decay < 0.0f) {
+        throw std::invalid_argument("Weight decay must be a non-negative finite number");
+    }
+    weight_decay_ = weight_decay;
 }
 
 void LstmNetwork::set_class_weights(float positive_weight, float negative_weight) {
@@ -606,6 +615,21 @@ LstmNetwork::ForwardCache LstmNetwork::forward_with_cache_gpu(const SequenceSamp
     std::vector<float> h_prev(hidden_size_, 0.0f);
     std::vector<float> c_prev(hidden_size_, 0.0f);
 
+    GpuBuffer f_buf = GpuBuffer::allocate(gpu_runtime_->context, hidden_size_ * sizeof(float));
+    GpuBuffer i_buf = GpuBuffer::allocate(gpu_runtime_->context, hidden_size_ * sizeof(float));
+    GpuBuffer g_buf = GpuBuffer::allocate(gpu_runtime_->context, hidden_size_ * sizeof(float));
+    GpuBuffer o_buf = GpuBuffer::allocate(gpu_runtime_->context, hidden_size_ * sizeof(float));
+    GpuBuffer z_buf = GpuBuffer::allocate(gpu_runtime_->context, z_size_ * sizeof(float));
+
+    GpuKernel dense_f(gpu_runtime_->program, "dense_forward", gpu_runtime_->context);
+    GpuKernel dense_i(gpu_runtime_->program, "dense_forward", gpu_runtime_->context);
+    GpuKernel dense_g(gpu_runtime_->program, "dense_forward", gpu_runtime_->context);
+    GpuKernel dense_o(gpu_runtime_->program, "dense_forward", gpu_runtime_->context);
+    GpuKernel sigmoid_f(gpu_runtime_->program, "sigmoid_activation", gpu_runtime_->context);
+    GpuKernel sigmoid_i(gpu_runtime_->program, "sigmoid_activation", gpu_runtime_->context);
+    GpuKernel tanh_g(gpu_runtime_->program, "tanh_activation", gpu_runtime_->context);
+    GpuKernel sigmoid_o(gpu_runtime_->program, "sigmoid_activation", gpu_runtime_->context);
+
     for (std::size_t t = 0; t < seq_len; ++t) {
         const std::vector<float> &x_t = use_source_view
             ? (*sample.source_samples)[sample.start_index + t].features
@@ -632,13 +656,8 @@ LstmNetwork::ForwardCache LstmNetwork::forward_with_cache_gpu(const SequenceSamp
             step.z[input_size_ + k] = h_prev[k];
         }
 
-        GpuBuffer z_buf = GpuBuffer::from_host(gpu_runtime_->context, step.z);
-        GpuBuffer f_buf = GpuBuffer::allocate(gpu_runtime_->context, hidden_size_ * sizeof(float));
-        GpuBuffer i_buf = GpuBuffer::allocate(gpu_runtime_->context, hidden_size_ * sizeof(float));
-        GpuBuffer g_buf = GpuBuffer::allocate(gpu_runtime_->context, hidden_size_ * sizeof(float));
-        GpuBuffer o_buf = GpuBuffer::allocate(gpu_runtime_->context, hidden_size_ * sizeof(float));
+        z_buf.copy_from_host_async(step.z.data(), z_size_ * sizeof(float));
 
-        GpuKernel dense_f(gpu_runtime_->program, "dense_forward", gpu_runtime_->context);
         dense_f.set_args({
             KernelArg::buffer(gpu_runtime_->Wf->get_buffer()),
             KernelArg::buffer(gpu_runtime_->bf->get_buffer()),
@@ -648,7 +667,6 @@ LstmNetwork::ForwardCache LstmNetwork::forward_with_cache_gpu(const SequenceSamp
         });
         dense_f.enqueue_1d(hidden_size_);
 
-        GpuKernel dense_i(gpu_runtime_->program, "dense_forward", gpu_runtime_->context);
         dense_i.set_args({
             KernelArg::buffer(gpu_runtime_->Wi->get_buffer()),
             KernelArg::buffer(gpu_runtime_->bi->get_buffer()),
@@ -658,7 +676,6 @@ LstmNetwork::ForwardCache LstmNetwork::forward_with_cache_gpu(const SequenceSamp
         });
         dense_i.enqueue_1d(hidden_size_);
 
-        GpuKernel dense_g(gpu_runtime_->program, "dense_forward", gpu_runtime_->context);
         dense_g.set_args({
             KernelArg::buffer(gpu_runtime_->Wg->get_buffer()),
             KernelArg::buffer(gpu_runtime_->bg->get_buffer()),
@@ -668,7 +685,6 @@ LstmNetwork::ForwardCache LstmNetwork::forward_with_cache_gpu(const SequenceSamp
         });
         dense_g.enqueue_1d(hidden_size_);
 
-        GpuKernel dense_o(gpu_runtime_->program, "dense_forward", gpu_runtime_->context);
         dense_o.set_args({
             KernelArg::buffer(gpu_runtime_->Wo->get_buffer()),
             KernelArg::buffer(gpu_runtime_->bo->get_buffer()),
@@ -678,26 +694,23 @@ LstmNetwork::ForwardCache LstmNetwork::forward_with_cache_gpu(const SequenceSamp
         });
         dense_o.enqueue_1d(hidden_size_);
 
-        GpuKernel sigmoid_f(gpu_runtime_->program, "sigmoid_activation", gpu_runtime_->context);
         sigmoid_f.set_args({KernelArg::buffer(f_buf.get_buffer())});
         sigmoid_f.enqueue_1d(hidden_size_);
 
-        GpuKernel sigmoid_i(gpu_runtime_->program, "sigmoid_activation", gpu_runtime_->context);
         sigmoid_i.set_args({KernelArg::buffer(i_buf.get_buffer())});
         sigmoid_i.enqueue_1d(hidden_size_);
 
-        GpuKernel tanh_g(gpu_runtime_->program, "tanh_activation", gpu_runtime_->context);
         tanh_g.set_args({KernelArg::buffer(g_buf.get_buffer())});
         tanh_g.enqueue_1d(hidden_size_);
 
-        GpuKernel sigmoid_o(gpu_runtime_->program, "sigmoid_activation", gpu_runtime_->context);
         sigmoid_o.set_args({KernelArg::buffer(o_buf.get_buffer())});
         sigmoid_o.enqueue_1d(hidden_size_);
 
-        step.f = f_buf.to_host<float>();
-        step.i = i_buf.to_host<float>();
-        step.g = g_buf.to_host<float>();
-        step.o = o_buf.to_host<float>();
+        f_buf.copy_to_host_async(step.f.data(), hidden_size_ * sizeof(float));
+        i_buf.copy_to_host_async(step.i.data(), hidden_size_ * sizeof(float));
+        g_buf.copy_to_host_async(step.g.data(), hidden_size_ * sizeof(float));
+        o_buf.copy_to_host_async(step.o.data(), hidden_size_ * sizeof(float));
+        gpu_runtime_->context.get_queue().finish();
 
         for (std::size_t r = 0; r < hidden_size_; ++r) {
             step.c[r] = step.f[r] * c_prev[r] + step.i[r] * step.g[r];
@@ -810,6 +823,35 @@ void LstmNetwork::accumulate_gradients_from_cache(const ForwardCache &cache,
         dh_next[r] = dlogit * Wy_[r];
     }
 
+    if (execution_backend_ == ExecutionBackend::GPU) {
+        ensure_gpu_runtime();
+    }
+
+    std::unique_ptr<GpuBuffer> tmp_buf;
+    std::unique_ptr<GpuBuffer> z_buf;
+    std::unique_ptr<GpuBuffer> daf_buf;
+    std::unique_ptr<GpuBuffer> dai_buf;
+    std::unique_ptr<GpuBuffer> dag_buf;
+    std::unique_ptr<GpuBuffer> dao_buf;
+    std::unique_ptr<GpuBuffer> dz_buf;
+    std::unique_ptr<GpuKernel> grad_accumulate_kernel;
+    std::unique_ptr<GpuKernel> backward_input_kernel;
+    std::unique_ptr<GpuKernel> add_inplace_kernel;
+    std::vector<float> dz_tail;
+    if (execution_backend_ == ExecutionBackend::GPU) {
+        tmp_buf = std::make_unique<GpuBuffer>(GpuBuffer::allocate(gpu_runtime_->context, z_size_ * sizeof(float)));
+        z_buf = std::make_unique<GpuBuffer>(GpuBuffer::allocate(gpu_runtime_->context, z_size_ * sizeof(float)));
+        daf_buf = std::make_unique<GpuBuffer>(GpuBuffer::allocate(gpu_runtime_->context, hidden_size_ * sizeof(float)));
+        dai_buf = std::make_unique<GpuBuffer>(GpuBuffer::allocate(gpu_runtime_->context, hidden_size_ * sizeof(float)));
+        dag_buf = std::make_unique<GpuBuffer>(GpuBuffer::allocate(gpu_runtime_->context, hidden_size_ * sizeof(float)));
+        dao_buf = std::make_unique<GpuBuffer>(GpuBuffer::allocate(gpu_runtime_->context, hidden_size_ * sizeof(float)));
+        dz_buf = std::make_unique<GpuBuffer>(GpuBuffer::allocate(gpu_runtime_->context, z_size_ * sizeof(float)));
+        grad_accumulate_kernel = std::make_unique<GpuKernel>(gpu_runtime_->program, "dense_accumulate_grads", gpu_runtime_->context);
+        backward_input_kernel = std::make_unique<GpuKernel>(gpu_runtime_->program, "dense_backward_input", gpu_runtime_->context);
+        add_inplace_kernel = std::make_unique<GpuKernel>(gpu_runtime_->program, "elementwise_add_inplace", gpu_runtime_->context);
+        dz_tail.assign(hidden_size_, 0.0f);
+    }
+
     for (std::size_t t = cache.steps.size(); t-- > 0;) {
         const StepCache &step = cache.steps[t];
         std::fill(da_f.begin(), da_f.end(), 0.0f);
@@ -837,61 +879,56 @@ void LstmNetwork::accumulate_gradients_from_cache(const ForwardCache &cache,
         }
 
         if (execution_backend_ == ExecutionBackend::GPU) {
-            ensure_gpu_runtime();
-            GpuBuffer z_buf = GpuBuffer::from_host(gpu_runtime_->context, step.z);
-            GpuBuffer daf_buf = GpuBuffer::from_host(gpu_runtime_->context, da_f);
-            GpuBuffer dai_buf = GpuBuffer::from_host(gpu_runtime_->context, da_i);
-            GpuBuffer dag_buf = GpuBuffer::from_host(gpu_runtime_->context, da_g);
-            GpuBuffer dao_buf = GpuBuffer::from_host(gpu_runtime_->context, da_o);
-            GpuBuffer dz_buf = GpuBuffer::from_host(gpu_runtime_->context, dz);
-            GpuBuffer tmp_buf = GpuBuffer::allocate(gpu_runtime_->context, z_size_ * sizeof(float));
+            z_buf->copy_from_host_async(step.z.data(), z_size_ * sizeof(float));
+            daf_buf->copy_from_host_async(da_f.data(), hidden_size_ * sizeof(float));
+            dai_buf->copy_from_host_async(da_i.data(), hidden_size_ * sizeof(float));
+            dag_buf->copy_from_host_async(da_g.data(), hidden_size_ * sizeof(float));
+            dao_buf->copy_from_host_async(da_o.data(), hidden_size_ * sizeof(float));
+            dz_buf->copy_from_host_async(dz.data(), z_size_ * sizeof(float));
 
             auto accumulate = [&](GpuBuffer &gradW, GpuBuffer &gradb, GpuBuffer &da) {
-                GpuKernel k(gpu_runtime_->program, "dense_accumulate_grads", gpu_runtime_->context);
-                k.set_args({
+                grad_accumulate_kernel->set_args({
                     KernelArg::buffer(gradW.get_buffer()),
                     KernelArg::buffer(gradb.get_buffer()),
-                    KernelArg::buffer(z_buf.get_buffer()),
+                    KernelArg::buffer(z_buf->get_buffer()),
                     KernelArg::buffer(da.get_buffer()),
                     KernelArg::scalar_uint(static_cast<uint32_t>(z_size_)),
                 });
-                k.enqueue_1d(hidden_size_);
+                grad_accumulate_kernel->enqueue_1d(hidden_size_);
             };
 
             auto accumulate_dz = [&](GpuBuffer &weights, GpuBuffer &da) {
-                GpuKernel backward_input(gpu_runtime_->program, "dense_backward_input", gpu_runtime_->context);
-                backward_input.set_args({
+                backward_input_kernel->set_args({
                     KernelArg::buffer(weights.get_buffer()),
                     KernelArg::buffer(da.get_buffer()),
-                    KernelArg::buffer(tmp_buf.get_buffer()),
+                    KernelArg::buffer(tmp_buf->get_buffer()),
                     KernelArg::scalar_uint(static_cast<uint32_t>(z_size_)),
                     KernelArg::scalar_uint(static_cast<uint32_t>(hidden_size_)),
                 });
-                backward_input.enqueue_1d(z_size_);
+                backward_input_kernel->enqueue_1d(z_size_);
 
-                GpuKernel add_inplace(gpu_runtime_->program, "elementwise_add_inplace", gpu_runtime_->context);
-                add_inplace.set_args({
-                    KernelArg::buffer(dz_buf.get_buffer()),
-                    KernelArg::buffer(tmp_buf.get_buffer()),
+                add_inplace_kernel->set_args({
+                    KernelArg::buffer(dz_buf->get_buffer()),
+                    KernelArg::buffer(tmp_buf->get_buffer()),
                 });
-                add_inplace.enqueue_1d(z_size_);
+                add_inplace_kernel->enqueue_1d(z_size_);
             };
 
-            accumulate(*gpu_runtime_->gradWf, *gpu_runtime_->gradbf, daf_buf);
-            accumulate(*gpu_runtime_->gradWi, *gpu_runtime_->gradbi, dai_buf);
-            accumulate(*gpu_runtime_->gradWg, *gpu_runtime_->gradbg, dag_buf);
-            accumulate(*gpu_runtime_->gradWo, *gpu_runtime_->gradbo, dao_buf);
+            accumulate(*gpu_runtime_->gradWf, *gpu_runtime_->gradbf, *daf_buf);
+            accumulate(*gpu_runtime_->gradWi, *gpu_runtime_->gradbi, *dai_buf);
+            accumulate(*gpu_runtime_->gradWg, *gpu_runtime_->gradbg, *dag_buf);
+            accumulate(*gpu_runtime_->gradWo, *gpu_runtime_->gradbo, *dao_buf);
 
-            accumulate_dz(*gpu_runtime_->Wf, daf_buf);
-            accumulate_dz(*gpu_runtime_->Wi, dai_buf);
-            accumulate_dz(*gpu_runtime_->Wg, dag_buf);
-            accumulate_dz(*gpu_runtime_->Wo, dao_buf);
+            accumulate_dz(*gpu_runtime_->Wf, *daf_buf);
+            accumulate_dz(*gpu_runtime_->Wi, *dai_buf);
+            accumulate_dz(*gpu_runtime_->Wg, *dag_buf);
+            accumulate_dz(*gpu_runtime_->Wo, *dao_buf);
 
-            std::vector<float> dz_tail(hidden_size_, 0.0f);
-            dz_buf.copy_to_host_offset(
+            dz_buf->copy_to_host_offset_async(
                 dz_tail.data(),
                 hidden_size_ * sizeof(float),
                 input_size_ * sizeof(float));
+            gpu_runtime_->context.get_queue().finish();
             std::fill(dh_prev.begin(), dh_prev.end(), 0.0f);
             for (std::size_t r = 0; r < hidden_size_; ++r) {
                 dh_prev[r] = dz_tail[r];
@@ -946,6 +983,14 @@ void LstmNetwork::apply_optimizer(std::vector<float> &params,
         } else if (optimizer_type_ == OptimizerType::Momentum) {
             state.momentum[i] = momentum_ * state.momentum[i] - learning_rate * grad;
             params[i] += state.momentum[i];
+        } else if (optimizer_type_ == OptimizerType::AdamW) {
+            state.adam_m[i] = adam_beta1_ * state.adam_m[i] + (1.0f - adam_beta1_) * grad;
+            state.adam_v[i] = adam_beta2_ * state.adam_v[i] + (1.0f - adam_beta2_) * grad * grad;
+            const float m_hat = state.adam_m[i] / bias_corr1;
+            const float v_hat = state.adam_v[i] / bias_corr2;
+            const float param_before = params[i];
+            const float adam_step = m_hat / (std::sqrt(v_hat) + adam_epsilon_);
+            params[i] = param_before - learning_rate * (adam_step + weight_decay_ * param_before);
         } else {
             state.adam_m[i] = adam_beta1_ * state.adam_m[i] + (1.0f - adam_beta1_) * grad;
             state.adam_v[i] = adam_beta2_ * state.adam_v[i] + (1.0f - adam_beta2_) * grad * grad;
@@ -1079,6 +1124,7 @@ float LstmNetwork::train_one_epoch(const std::vector<SequenceSample> &dataset,
                 adam_beta1_,
                 adam_beta2_,
                 adam_epsilon_,
+                weight_decay_,
                 bias_corr1,
                 bias_corr2,
                 inv_batch,
@@ -1103,6 +1149,7 @@ float LstmNetwork::train_one_epoch(const std::vector<SequenceSample> &dataset,
                 adam_beta1_,
                 adam_beta2_,
                 adam_epsilon_,
+                weight_decay_,
                 bias_corr1,
                 bias_corr2,
                 inv_batch,
@@ -1127,6 +1174,7 @@ float LstmNetwork::train_one_epoch(const std::vector<SequenceSample> &dataset,
                 adam_beta1_,
                 adam_beta2_,
                 adam_epsilon_,
+                weight_decay_,
                 bias_corr1,
                 bias_corr2,
                 inv_batch,
@@ -1151,6 +1199,7 @@ float LstmNetwork::train_one_epoch(const std::vector<SequenceSample> &dataset,
                 adam_beta1_,
                 adam_beta2_,
                 adam_epsilon_,
+                weight_decay_,
                 bias_corr1,
                 bias_corr2,
                 inv_batch,
@@ -1176,6 +1225,16 @@ float LstmNetwork::train_one_epoch(const std::vector<SequenceSample> &dataset,
         } else if (optimizer_type_ == OptimizerType::Momentum) {
             state_by_momentum_ = momentum_ * state_by_momentum_ - learning_rate * grad_by;
             by_ += state_by_momentum_;
+        } else if (optimizer_type_ == OptimizerType::AdamW) {
+            const float beta1_pow = pow_uint(adam_beta1_, next_step);
+            const float beta2_pow = pow_uint(adam_beta2_, next_step);
+            const float bias_corr1 = 1.0f - beta1_pow;
+            const float bias_corr2 = 1.0f - beta2_pow;
+            state_by_adam_m_ = adam_beta1_ * state_by_adam_m_ + (1.0f - adam_beta1_) * grad_by;
+            state_by_adam_v_ = adam_beta2_ * state_by_adam_v_ + (1.0f - adam_beta2_) * grad_by * grad_by;
+            const float m_hat = state_by_adam_m_ / bias_corr1;
+            const float v_hat = state_by_adam_v_ / bias_corr2;
+            by_ -= learning_rate * m_hat / (std::sqrt(v_hat) + adam_epsilon_);
         } else {
             const float beta1_pow = pow_uint(adam_beta1_, next_step);
             const float beta2_pow = pow_uint(adam_beta2_, next_step);

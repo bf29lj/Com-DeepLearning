@@ -20,11 +20,12 @@ void print_usage() {
               << "  --load-model <path>  Load model weights from file before running\n"
               << "  --save-model <path>  Save model weights to file after running\n"
               << "  --backend <cpu|gpu>  Execution backend (default: cpu)\n"
-              << "  --optimizer <sgd|momentum|adam> Optimizer type (default: sgd)\n"
+              << "  --optimizer <sgd|momentum|adam|adamw> Optimizer type (default: sgd)\n"
               << "  --momentum <float>   Momentum factor for momentum SGD (default: 0.9)\n"
               << "  --adam-beta1 <float> Adam beta1 (default: 0.9)\n"
               << "  --adam-beta2 <float> Adam beta2 (default: 0.999)\n"
               << "  --adam-eps <float>   Adam epsilon (default: 1e-8)\n"
+              << "  --weight-decay <float> AdamW decoupled weight decay (default: 0.0)\n"
               << "  --hidden-act <relu|sigmoid|tanh|leaky_relu|gelu> Hidden layer activation (default: relu)\n"
               << "  --output-act <linear|sigmoid|tanh|relu|leaky_relu|gelu> Output activation (default: sigmoid)\n"
               << "  --results-csv <path> Write per-epoch metrics to CSV\n"
@@ -90,7 +91,10 @@ OptimizerType parse_optimizer(const std::string &value) {
     if (value == "adam") {
         return OptimizerType::Adam;
     }
-    throw std::invalid_argument("Invalid optimizer: " + value + ". Use sgd, momentum or adam.");
+    if (value == "adamw") {
+        return OptimizerType::AdamW;
+    }
+    throw std::invalid_argument("Invalid optimizer: " + value + ". Use sgd, momentum, adam or adamw.");
 }
 
 ActivationType parse_activation(const std::string &value) {
@@ -180,6 +184,8 @@ TrainingConfig parse_args(int argc, char **argv) {
             cfg.adam_beta2 = std::stof(need_value(arg));
         } else if (arg == "--adam-eps") {
             cfg.adam_epsilon = std::stof(need_value(arg));
+        } else if (arg == "--weight-decay") {
+            cfg.weight_decay = std::stof(need_value(arg));
         } else if (arg == "--hidden-act") {
             cfg.hidden_activation = parse_activation(need_value(arg));
             if (cfg.hidden_activation == ActivationType::Linear) {

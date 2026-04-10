@@ -208,6 +208,8 @@ void load_training_config_file(const std::filesystem::path &path, TrainingConfig
             config.optimizer = OptimizerType::Momentum;
         } else if (optimizer == "adam") {
             config.optimizer = OptimizerType::Adam;
+        } else if (optimizer == "adamw") {
+            config.optimizer = OptimizerType::AdamW;
         } else {
             throw std::runtime_error(parse_error_with_context(path, "Invalid optimizer: " + optimizer));
         }
@@ -256,6 +258,10 @@ void load_training_config_file(const std::filesystem::path &path, TrainingConfig
     const std::string adam_epsilon = get_or_empty(sections, "runtime", "adam_epsilon");
     if (!adam_epsilon.empty()) {
         config.adam_epsilon = std::stof(adam_epsilon);
+    }
+    const std::string weight_decay = get_or_empty(sections, "runtime", "weight_decay");
+    if (!weight_decay.empty()) {
+        config.weight_decay = std::stof(weight_decay);
     }
     const std::string hidden_activation = to_lower(get_or_empty(sections, "runtime", "hidden_activation"));
     if (!hidden_activation.empty()) {
@@ -379,6 +385,8 @@ void save_training_config_file(const std::filesystem::path &path, const Training
         optimizer = "momentum";
     } else if (config.optimizer == OptimizerType::Adam) {
         optimizer = "adam";
+    } else if (config.optimizer == OptimizerType::AdamW) {
+        optimizer = "adamw";
     }
     out << "optimizer=" << optimizer << "\n";
     out << "learning_rate=" << config.learning_rate << "\n";
@@ -388,6 +396,7 @@ void save_training_config_file(const std::filesystem::path &path, const Training
     out << "adam_beta1=" << config.adam_beta1 << "\n";
     out << "adam_beta2=" << config.adam_beta2 << "\n";
     out << "adam_epsilon=" << config.adam_epsilon << "\n";
+    out << "weight_decay=" << config.weight_decay << "\n";
     out << "lr_decay=" << config.lr_decay << "\n";
     out << "lr_decay_every=" << config.lr_decay_every << "\n";
     out << "min_learning_rate=" << config.min_learning_rate << "\n";
