@@ -738,6 +738,209 @@ LstmNetwork::ForwardCache LstmNetwork::forward_with_cache(const SequenceSample &
     return forward_with_cache_cpu(sample);
 }
 
+float LstmNetwork::predict_probability_cpu_direct(const SequenceSample &sample) const {
+    std::size_t seq_len = sample.timesteps.size();
+    bool use_source_view = false;
+    if (sample.source_samples != nullptr && sample.length > 0) {
+        use_source_view = true;
+        seq_len = sample.length;
+        if (sample.start_index + sample.length > sample.source_samples->size()) {
+            throw std::invalid_argument("LSTM sequence sample window is out of range");
+        }
+    }
+
+    if (seq_len == 0) {
+        throw std::invalid_argument("LSTM sequence cannot be empty");
+    }
+
+    std::vector<float> h_prev(hidden_size_, 0.0f);
+    std::vector<float> c_prev(hidden_size_, 0.0f);
+    std::vector<float> z(z_size_, 0.0f);
+    std::vector<float> c_curr(hidden_size_, 0.0f);
+    std::vector<float> h_curr(hidden_size_, 0.0f);
+
+    for (std::size_t t = 0; t < seq_len; ++t) {
+        const std::vector<float> &x_t = use_source_view
+            ? (*sample.source_samples)[sample.start_index + t].features
+            : sample.timesteps[t];
+
+        if (x_t.size() != input_size_) {
+            throw std::invalid_argument("LSTM sequence timestep feature size mismatch");
+        }
+
+        std::copy(x_t.begin(), x_t.end(), z.begin());
+        std::copy(h_prev.begin(), h_prev.end(), z.begin() + static_cast<std::ptrdiff_t>(input_size_));
+
+        for (std::size_t r = 0; r < hidden_size_; ++r) {
+            float af = bf_[r];
+            float ai = bi_[r];
+            float ag = bg_[r];
+            float ao = bo_[r];
+            const std::size_t row_offset = r * z_size_;
+            for (std::size_t k = 0; k < z_size_; ++k) {
+                const float zv = z[k];
+                af += Wf_[row_offset + k] * zv;
+                ai += Wi_[row_offset + k] * zv;
+                ag += Wg_[row_offset + k] * zv;
+                ao += Wo_[row_offset + k] * zv;
+            }
+
+            const float f = sigmoid(af);
+            const float i = sigmoid(ai);
+            const float g = std::tanh(ag);
+            const float o = sigmoid(ao);
+            c_curr[r] = f * c_prev[r] + i * g;
+            h_curr[r] = o * std::tanh(c_curr[r]);
+        }
+
+        h_prev.swap(h_curr);
+        c_prev.swap(c_curr);
+    }
+
+    float logit = by_;
+    for (std::size_t r = 0; r < hidden_size_; ++r) {
+        logit += Wy_[r] * h_prev[r];
+    }
+    return sigmoid(logit);
+}
+
+float LstmNetwork::predict_probability_gpu_direct(const SequenceSample &sample) const {
+    ensure_gpu_runtime();
+
+    std::size_t seq_len = sample.timesteps.size();
+    bool use_source_view = false;
+    if (sample.source_samples != nullptr && sample.length > 0) {
+        use_source_view = true;
+        seq_len = sample.length;
+        if (sample.start_index + sample.length > sample.source_samples->size()) {
+            throw std::invalid_argument("LSTM sequence sample window is out of range");
+        }
+    }
+
+    if (seq_len == 0) {
+        throw std::invalid_argument("LSTM sequence cannot be empty");
+    }
+
+    GpuBuffer x_buf = GpuBuffer::allocate(gpu_runtime_->context, input_size_ * sizeof(float));
+    GpuBuffer z_buf = GpuBuffer::allocate(gpu_runtime_->context, z_size_ * sizeof(float));
+    GpuBuffer f_buf = GpuBuffer::allocate(gpu_runtime_->context, hidden_size_ * sizeof(float));
+    GpuBuffer i_buf = GpuBuffer::allocate(gpu_runtime_->context, hidden_size_ * sizeof(float));
+    GpuBuffer g_buf = GpuBuffer::allocate(gpu_runtime_->context, hidden_size_ * sizeof(float));
+    GpuBuffer o_buf = GpuBuffer::allocate(gpu_runtime_->context, hidden_size_ * sizeof(float));
+
+    GpuBuffer h_a = GpuBuffer::allocate(gpu_runtime_->context, hidden_size_ * sizeof(float));
+    GpuBuffer h_b = GpuBuffer::allocate(gpu_runtime_->context, hidden_size_ * sizeof(float));
+    GpuBuffer c_a = GpuBuffer::allocate(gpu_runtime_->context, hidden_size_ * sizeof(float));
+    GpuBuffer c_b = GpuBuffer::allocate(gpu_runtime_->context, hidden_size_ * sizeof(float));
+
+    enqueue_fill_float_lstm(gpu_runtime_->context, gpu_runtime_->program, h_a, 0.0f, hidden_size_);
+    enqueue_fill_float_lstm(gpu_runtime_->context, gpu_runtime_->program, c_a, 0.0f, hidden_size_);
+
+    GpuKernel concat_kernel(gpu_runtime_->program, "concat_input_hidden", gpu_runtime_->context);
+    GpuKernel dense_f(gpu_runtime_->program, "dense_forward", gpu_runtime_->context);
+    GpuKernel dense_i(gpu_runtime_->program, "dense_forward", gpu_runtime_->context);
+    GpuKernel dense_g(gpu_runtime_->program, "dense_forward", gpu_runtime_->context);
+    GpuKernel dense_o(gpu_runtime_->program, "dense_forward", gpu_runtime_->context);
+    GpuKernel sigmoid_f(gpu_runtime_->program, "sigmoid_activation", gpu_runtime_->context);
+    GpuKernel sigmoid_i(gpu_runtime_->program, "sigmoid_activation", gpu_runtime_->context);
+    GpuKernel tanh_g(gpu_runtime_->program, "tanh_activation", gpu_runtime_->context);
+    GpuKernel sigmoid_o(gpu_runtime_->program, "sigmoid_activation", gpu_runtime_->context);
+    GpuKernel cell_update(gpu_runtime_->program, "lstm_cell_update", gpu_runtime_->context);
+
+    GpuBuffer *h_prev = &h_a;
+    GpuBuffer *h_curr = &h_b;
+    GpuBuffer *c_prev = &c_a;
+    GpuBuffer *c_curr = &c_b;
+
+    for (std::size_t t = 0; t < seq_len; ++t) {
+        const std::vector<float> &x_t = use_source_view
+            ? (*sample.source_samples)[sample.start_index + t].features
+            : sample.timesteps[t];
+        if (x_t.size() != input_size_) {
+            throw std::invalid_argument("LSTM sequence timestep feature size mismatch");
+        }
+
+        x_buf.copy_from_host_async(x_t.data(), input_size_ * sizeof(float));
+
+        concat_kernel.set_args({
+            KernelArg::buffer(x_buf.get_buffer()),
+            KernelArg::buffer(h_prev->get_buffer()),
+            KernelArg::buffer(z_buf.get_buffer()),
+            KernelArg::scalar_uint(static_cast<uint32_t>(input_size_)),
+        });
+        concat_kernel.enqueue_1d(z_size_);
+
+        dense_f.set_args({
+            KernelArg::buffer(gpu_runtime_->Wf->get_buffer()),
+            KernelArg::buffer(gpu_runtime_->bf->get_buffer()),
+            KernelArg::buffer(z_buf.get_buffer()),
+            KernelArg::buffer(f_buf.get_buffer()),
+            KernelArg::scalar_uint(static_cast<uint32_t>(z_size_)),
+        });
+        dense_f.enqueue_1d(hidden_size_);
+
+        dense_i.set_args({
+            KernelArg::buffer(gpu_runtime_->Wi->get_buffer()),
+            KernelArg::buffer(gpu_runtime_->bi->get_buffer()),
+            KernelArg::buffer(z_buf.get_buffer()),
+            KernelArg::buffer(i_buf.get_buffer()),
+            KernelArg::scalar_uint(static_cast<uint32_t>(z_size_)),
+        });
+        dense_i.enqueue_1d(hidden_size_);
+
+        dense_g.set_args({
+            KernelArg::buffer(gpu_runtime_->Wg->get_buffer()),
+            KernelArg::buffer(gpu_runtime_->bg->get_buffer()),
+            KernelArg::buffer(z_buf.get_buffer()),
+            KernelArg::buffer(g_buf.get_buffer()),
+            KernelArg::scalar_uint(static_cast<uint32_t>(z_size_)),
+        });
+        dense_g.enqueue_1d(hidden_size_);
+
+        dense_o.set_args({
+            KernelArg::buffer(gpu_runtime_->Wo->get_buffer()),
+            KernelArg::buffer(gpu_runtime_->bo->get_buffer()),
+            KernelArg::buffer(z_buf.get_buffer()),
+            KernelArg::buffer(o_buf.get_buffer()),
+            KernelArg::scalar_uint(static_cast<uint32_t>(z_size_)),
+        });
+        dense_o.enqueue_1d(hidden_size_);
+
+        sigmoid_f.set_args({KernelArg::buffer(f_buf.get_buffer())});
+        sigmoid_f.enqueue_1d(hidden_size_);
+        sigmoid_i.set_args({KernelArg::buffer(i_buf.get_buffer())});
+        sigmoid_i.enqueue_1d(hidden_size_);
+        tanh_g.set_args({KernelArg::buffer(g_buf.get_buffer())});
+        tanh_g.enqueue_1d(hidden_size_);
+        sigmoid_o.set_args({KernelArg::buffer(o_buf.get_buffer())});
+        sigmoid_o.enqueue_1d(hidden_size_);
+
+        cell_update.set_args({
+            KernelArg::buffer(f_buf.get_buffer()),
+            KernelArg::buffer(i_buf.get_buffer()),
+            KernelArg::buffer(g_buf.get_buffer()),
+            KernelArg::buffer(o_buf.get_buffer()),
+            KernelArg::buffer(c_prev->get_buffer()),
+            KernelArg::buffer(c_curr->get_buffer()),
+            KernelArg::buffer(h_curr->get_buffer()),
+        });
+        cell_update.enqueue_1d(hidden_size_);
+
+        std::swap(h_prev, h_curr);
+        std::swap(c_prev, c_curr);
+    }
+
+    std::vector<float> h_last(hidden_size_, 0.0f);
+    h_prev->copy_to_host_async(h_last.data(), hidden_size_ * sizeof(float));
+    gpu_runtime_->context.get_queue().finish();
+
+    float logit = by_;
+    for (std::size_t r = 0; r < hidden_size_; ++r) {
+        logit += Wy_[r] * h_last[r];
+    }
+    return sigmoid(logit);
+}
+
 float LstmNetwork::compute_loss(float prediction, float target, LossType loss_type) const {
     if (loss_type == LossType::MSE) {
         const float diff = prediction - target;
@@ -1004,22 +1207,36 @@ void LstmNetwork::apply_optimizer(std::vector<float> &params,
 float LstmNetwork::predict_probability(const std::vector<std::vector<float>> &sequence) const {
     SequenceSample sample;
     sample.timesteps = sequence;
-    return forward_with_cache(sample).probability;
+    if (execution_backend_ == ExecutionBackend::GPU) {
+        return predict_probability_gpu_direct(sample);
+    }
+    return predict_probability_cpu_direct(sample);
 }
 
 float LstmNetwork::predict_probability(const SequenceSample &sample) const {
-    return forward_with_cache(sample).probability;
+    if (execution_backend_ == ExecutionBackend::GPU) {
+        return predict_probability_gpu_direct(sample);
+    }
+    return predict_probability_cpu_direct(sample);
 }
 
-float LstmNetwork::evaluate_cost(const std::vector<SequenceSample> &dataset, LossType loss_type) const {
+float LstmNetwork::evaluate_cost(const std::vector<SequenceSample> &dataset,
+                                 LossType loss_type,
+                                 const MlpNetwork::ProgressCallback &progress_callback) const {
     if (dataset.empty()) {
         throw std::invalid_argument("Sequence dataset is empty");
     }
 
     float total_loss = 0.0f;
+    std::size_t processed = 0;
     for (const auto &sample : dataset) {
         const float prediction = predict_probability(sample);
         total_loss += compute_loss(prediction, static_cast<float>(sample.label), loss_type);
+        ++processed;
+        if (progress_callback && ((processed % 256 == 0) || (processed == dataset.size()))) {
+            const float avg_loss = total_loss / static_cast<float>(processed);
+            progress_callback(processed, dataset.size(), avg_loss);
+        }
     }
     return total_loss / static_cast<float>(dataset.size());
 }
@@ -1029,7 +1246,8 @@ float LstmNetwork::train_one_epoch(const std::vector<SequenceSample> &dataset,
                                    LossType loss_type,
                                    std::size_t batch_size,
                                    float timeout_sec,
-                                   bool *timed_out) {
+                                   bool *timed_out,
+                                   const MlpNetwork::ProgressCallback &progress_callback) {
     if (dataset.empty()) {
         throw std::invalid_argument("Sequence dataset is empty");
     }
@@ -1251,6 +1469,13 @@ float LstmNetwork::train_one_epoch(const std::vector<SequenceSample> &dataset,
 
         if (execution_backend_ != ExecutionBackend::GPU) {
             invalidate_gpu_parameter_cache();
+        }
+
+        if (progress_callback) {
+            const float avg_loss = processed_samples == 0
+                ? 0.0f
+                : total_loss / static_cast<float>(processed_samples);
+            progress_callback(processed_samples, dataset.size(), avg_loss);
         }
     }
 

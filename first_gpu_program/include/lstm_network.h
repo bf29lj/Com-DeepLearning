@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -36,13 +37,16 @@ public:
 
     float predict_probability(const std::vector<std::vector<float>> &sequence) const;
     float predict_probability(const SequenceSample &sample) const;
-    float evaluate_cost(const std::vector<SequenceSample> &dataset, LossType loss_type) const;
+    float evaluate_cost(const std::vector<SequenceSample> &dataset,
+                        LossType loss_type,
+                        const MlpNetwork::ProgressCallback &progress_callback = {}) const;
     float train_one_epoch(const std::vector<SequenceSample> &dataset,
                           float learning_rate,
                           LossType loss_type,
                           std::size_t batch_size,
                           float timeout_sec = 0.0f,
-                          bool *timed_out = nullptr);
+                          bool *timed_out = nullptr,
+                          const MlpNetwork::ProgressCallback &progress_callback = {});
 
 private:
     struct StepCache {
@@ -84,6 +88,8 @@ private:
     ForwardCache forward_with_cache_cpu(const std::vector<std::vector<float>> &sequence) const;
     ForwardCache forward_with_cache_cpu(const SequenceSample &sample) const;
     ForwardCache forward_with_cache_gpu(const SequenceSample &sample) const;
+    float predict_probability_cpu_direct(const SequenceSample &sample) const;
+    float predict_probability_gpu_direct(const SequenceSample &sample) const;
     ForwardCache forward_with_cache(const SequenceSample &sample) const;
     void ensure_gpu_runtime() const;
     void invalidate_gpu_parameter_cache();

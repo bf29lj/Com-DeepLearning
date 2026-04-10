@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -88,6 +89,8 @@ struct OperationConfig {
 // Configurable 1D MLP forward network.
 class MlpNetwork {
 public:
+    using ProgressCallback = std::function<void(std::size_t, std::size_t, float)>;
+
     // Compatibility constructor: converts layer sizes into
     // Linear + activation operation sequence.
     MlpNetwork(std::vector<std::size_t> layer_sizes);
@@ -122,23 +125,29 @@ public:
     float train_one_epoch(const ManufacturingDefectDataset &dataset,
                           float learning_rate,
                           LossType loss_type,
-                          std::size_t batch_size = 1);
+                          std::size_t batch_size = 1,
+                          const ProgressCallback &progress_callback = {});
     float train_one_epoch_cpu(const ManufacturingDefectDataset &dataset,
                               float learning_rate,
                               LossType loss_type,
-                              std::size_t batch_size = 1);
+                              std::size_t batch_size = 1,
+                              const ProgressCallback &progress_callback = {});
     float train_one_epoch_gpu(const ManufacturingDefectDataset &dataset,
                               float learning_rate,
                               LossType loss_type,
-                              std::size_t batch_size = 1);
+                              std::size_t batch_size = 1,
+                              const ProgressCallback &progress_callback = {});
 
     // Evaluates average loss over a dataset on the CPU.
     float evaluate_cost(const ManufacturingDefectDataset &dataset,
-                        LossType loss_type) const;
+                        LossType loss_type,
+                        const ProgressCallback &progress_callback = {}) const;
     float evaluate_cost_cpu(const ManufacturingDefectDataset &dataset,
-                            LossType loss_type) const;
+                            LossType loss_type,
+                            const ProgressCallback &progress_callback = {}) const;
     float evaluate_cost_gpu(const ManufacturingDefectDataset &dataset,
-                            LossType loss_type) const;
+                            LossType loss_type,
+                            const ProgressCallback &progress_callback = {}) const;
 
     // Returns the configured operation pipeline.
     const std::vector<OperationConfig> &operations() const { return operations_; }
@@ -202,11 +211,13 @@ private:
     float train_one_epoch_internal(const ManufacturingDefectDataset &dataset,
                                    float learning_rate,
                                    LossType loss_type,
-                                   std::size_t batch_size);
+                                   std::size_t batch_size,
+                                   const ProgressCallback &progress_callback);
     float train_one_epoch_internal_gpu(const ManufacturingDefectDataset &dataset,
                                        float learning_rate,
                                        LossType loss_type,
-                                       std::size_t batch_size);
+                                       std::size_t batch_size,
+                                       const ProgressCallback &progress_callback);
     void backward_update_cpu(const ForwardCache &cache,
                              float target,
                              float learning_rate,

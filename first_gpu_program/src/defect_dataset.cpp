@@ -27,7 +27,25 @@ float parse_float(const std::string &text, std::size_t row_index, const std::str
 
 }  // namespace
 
-ManufacturingDefectDataset ManufacturingDefectDataset::load_csv(const std::filesystem::path &csv_path) {
+ManufacturingDefectDataset ManufacturingDefectDataset::load_csv(
+    const std::filesystem::path &csv_path,
+    const ProgressCallback &progress_callback) {
+    std::ifstream counter(csv_path);
+    if (!counter.is_open()) {
+        throw std::runtime_error("Failed to open dataset: " + csv_path.string());
+    }
+    std::string counter_header;
+    if (!std::getline(counter, counter_header)) {
+        throw std::runtime_error("Dataset is empty: " + csv_path.string());
+    }
+    std::size_t total_rows = 0;
+    std::string counter_line;
+    while (std::getline(counter, counter_line)) {
+        if (!counter_line.empty()) {
+            ++total_rows;
+        }
+    }
+
     std::ifstream input(csv_path);
     if (!input.is_open()) {
         throw std::runtime_error("Failed to open dataset: " + csv_path.string());
@@ -66,10 +84,18 @@ ManufacturingDefectDataset ManufacturingDefectDataset::load_csv(const std::files
         sample.label = static_cast<uint8_t>(parse_float(cells.back(), row_index, header.back()));
         dataset.samples_.push_back(std::move(sample));
         ++row_index;
+
+        if (progress_callback && ((row_index % 256 == 0) || (row_index == total_rows))) {
+            progress_callback(row_index, total_rows);
+        }
     }
 
     if (dataset.samples_.empty()) {
         throw std::runtime_error("Dataset contains no samples: " + csv_path.string());
+    }
+
+    if (progress_callback) {
+        progress_callback(dataset.samples_.size(), total_rows);
     }
 
     return dataset;

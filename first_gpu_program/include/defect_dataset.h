@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -18,9 +19,11 @@ struct DefectSample {
 class ManufacturingDefectDataset {
 public:
     ManufacturingDefectDataset() = default;
+    using ProgressCallback = std::function<void(std::size_t, std::size_t)>;
 
     // Loads all rows from a processed CSV file into memory.
-    static ManufacturingDefectDataset load_csv(const std::filesystem::path &csv_path);
+    static ManufacturingDefectDataset load_csv(const std::filesystem::path &csv_path,
+                                               const ProgressCallback &progress_callback = {});
 
     const std::vector<std::string> &feature_names() const { return feature_names_; }
     std::size_t feature_count() const { return feature_names_.size(); }

@@ -3,14 +3,24 @@
 #include "defect_dataset.h"
 #include "lstm_network.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <sstream>
+#include <unordered_map>
 #include <vector>
+
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -144,6 +154,170 @@ float safe_div(std::uint64_t numerator, std::uint64_t denominator) {
     return static_cast<float>(numerator) / static_cast<float>(denominator);
 }
 
+bool is_stdout_tty();
+
+std::string format_seconds_mmss(float seconds) {
+    if (!std::isfinite(seconds) || seconds < 0.0f) {
+        return "--:--";
+    }
+    const int total = static_cast<int>(seconds + 0.5f);
+    const int minutes = total / 60;
+    const int secs = total % 60;
+    std::ostringstream oss;
+    oss << std::setfill('0') << std::setw(2) << minutes
+        << ':' << std::setw(2) << secs;
+    return oss.str();
+}
+
+void print_epoch_progress_bar(std::size_t epoch,
+                              std::size_t total_epochs,
+                              std::size_t processed,
+                              std::size_t total,
+                              float avg_loss,
+                              float learning_rate,
+                              const std::chrono::high_resolution_clock::time_point &epoch_start) {
+    const std::size_t clamped_total = std::max<std::size_t>(total, 1);
+    const std::size_t clamped_processed = std::min(processed, clamped_total);
+    const bool interactive = is_stdout_tty();
+
+    constexpr std::size_t kBarWidth = 28;
+    const float ratio = static_cast<float>(clamped_processed) / static_cast<float>(clamped_total);
+    const std::size_t filled = static_cast<std::size_t>(std::round(ratio * static_cast<float>(kBarWidth)));
+
+    const auto now = std::chrono::high_resolution_clock::now();
+    const float elapsed_sec = std::chrono::duration_cast<std::chrono::duration<float>>(now - epoch_start).count();
+    const float eta_sec = clamped_processed == 0
+        ? 0.0f
+        : std::max(0.0f, elapsed_sec * static_cast<float>(clamped_total - clamped_processed) / static_cast<float>(clamped_processed));
+
+    if (!interactive) {
+        static thread_local std::size_t last_epoch = 0;
+        static thread_local int last_bucket = -1;
+        if (last_epoch != epoch) {
+            last_epoch = epoch;
+            last_bucket = -1;
+        }
+
+        const int bucket = static_cast<int>(ratio * 20.0f);  // 5% step
+        if (clamped_processed < clamped_total && bucket <= last_bucket) {
+            return;
+        }
+        last_bucket = bucket;
+
+        std::cout << "[Epoch " << epoch << '/' << total_epochs << "] "
+                  << std::fixed << std::setprecision(1) << (ratio * 100.0f) << "% "
+                  << clamped_processed << '/' << clamped_total
+                  << " loss=" << std::setprecision(6) << avg_loss
+                  << " lr=" << learning_rate
+                  << " elapsed=" << format_seconds_mmss(elapsed_sec)
+                  << " eta=" << format_seconds_mmss(eta_sec)
+                  << std::endl;
+        std::cout.unsetf(std::ios::floatfield);
+        return;
+    }
+
+    std::cout << "\x1b[2K\r"
+              << "[Epoch " << epoch << '/' << total_epochs << "] [";
+    for (std::size_t i = 0; i < kBarWidth; ++i) {
+        std::cout << (i < filled ? '#' : '-');
+    }
+    std::cout << "] "
+              << std::fixed << std::setprecision(1) << (ratio * 100.0f) << "% "
+              << clamped_processed << '/' << clamped_total
+              << " loss=" << std::setprecision(6) << avg_loss
+              << " lr=" << learning_rate
+              << " elapsed=" << format_seconds_mmss(elapsed_sec)
+              << " eta=" << format_seconds_mmss(eta_sec)
+              << "   "
+              << std::flush;
+    std::cout.unsetf(std::ios::floatfield);
+}
+
+void print_stage_progress_bar(const std::string &stage,
+                              std::size_t processed,
+                              std::size_t total,
+                              float metric_value = -1.0f,
+                              const char *metric_name = nullptr) {
+    using Clock = std::chrono::high_resolution_clock;
+    static std::unordered_map<std::string, Clock::time_point> stage_start_times;
+
+    const std::size_t clamped_total = std::max<std::size_t>(total, 1);
+    const std::size_t clamped_processed = std::min(processed, clamped_total);
+    const bool interactive = is_stdout_tty();
+    const auto now = Clock::now();
+
+    auto it = stage_start_times.find(stage);
+    if (it == stage_start_times.end()) {
+        it = stage_start_times.emplace(stage, now).first;
+    }
+    const float elapsed_sec =
+        std::chrono::duration_cast<std::chrono::duration<float>>(now - it->second).count();
+    const float eta_sec = clamped_processed == 0
+        ? 0.0f
+        : std::max(0.0f,
+                   elapsed_sec * static_cast<float>(clamped_total - clamped_processed) /
+                       static_cast<float>(clamped_processed));
+
+    constexpr std::size_t kBarWidth = 24;
+    const float ratio = static_cast<float>(clamped_processed) / static_cast<float>(clamped_total);
+    const std::size_t filled = static_cast<std::size_t>(std::round(ratio * static_cast<float>(kBarWidth)));
+
+    if (!interactive) {
+        static thread_local std::string last_stage;
+        static thread_local int last_bucket = -1;
+        if (last_stage != stage) {
+            last_stage = stage;
+            last_bucket = -1;
+        }
+        const int bucket = static_cast<int>(ratio * 20.0f);  // 5% step
+        if (clamped_processed < clamped_total && bucket <= last_bucket) {
+            return;
+        }
+        last_bucket = bucket;
+
+        std::cout << '[' << stage << "] "
+                  << std::fixed << std::setprecision(1) << (ratio * 100.0f) << "% "
+                  << clamped_processed << '/' << clamped_total
+                  << " elapsed=" << format_seconds_mmss(elapsed_sec)
+                  << " eta=" << format_seconds_mmss(eta_sec);
+        if (metric_name != nullptr && metric_value >= 0.0f) {
+            std::cout << ' ' << metric_name << '=' << std::setprecision(6) << metric_value;
+        }
+        std::cout << std::endl;
+        std::cout.unsetf(std::ios::floatfield);
+        if (clamped_processed >= clamped_total) {
+            stage_start_times.erase(stage);
+        }
+        return;
+    }
+
+    std::cout << "\x1b[2K\r" << '[' << stage << "] [";
+    for (std::size_t i = 0; i < kBarWidth; ++i) {
+        std::cout << (i < filled ? '#' : '-');
+    }
+    std::cout << "] "
+              << std::fixed << std::setprecision(1) << (ratio * 100.0f) << "% "
+              << clamped_processed << '/' << clamped_total
+              << " elapsed=" << format_seconds_mmss(elapsed_sec)
+              << " eta=" << format_seconds_mmss(eta_sec);
+    if (metric_name != nullptr && metric_value >= 0.0f) {
+        std::cout << ' ' << metric_name << '=' << std::setprecision(6) << metric_value;
+    }
+    std::cout << "   " << std::flush;
+    std::cout.unsetf(std::ios::floatfield);
+    if (clamped_processed >= clamped_total) {
+        stage_start_times.erase(stage);
+    }
+}
+
+bool is_stdout_tty() {
+#if defined(_WIN32)
+    return _isatty(_fileno(stdout)) != 0;
+#else
+    return isatty(fileno(stdout)) != 0;
+#endif
+}
+
 void compute_auto_class_weights(const ManufacturingDefectDataset &dataset,
                                 float &positive_weight,
                                 float &negative_weight)
@@ -171,9 +345,11 @@ void compute_auto_class_weights(const ManufacturingDefectDataset &dataset,
 ClassificationMetrics evaluate_classification_metrics(
     MlpNetwork &network,
     const ManufacturingDefectDataset &dataset,
-    float threshold)
+    float threshold,
+    const MlpNetwork::ProgressCallback &progress_callback = {})
 {
     ClassificationMetrics metrics;
+    std::size_t processed = 0;
 
     for (const auto &sample : dataset.samples()) {
         const std::vector<float> output = network.forward(sample.features);
@@ -189,6 +365,11 @@ ClassificationMetrics evaluate_classification_metrics(
             ++metrics.tn;
         } else {
             ++metrics.fn;
+        }
+
+        ++processed;
+        if (progress_callback && ((processed % 256 == 0) || (processed == dataset.size()))) {
+            progress_callback(processed, dataset.size(), 0.0f);
         }
     }
 
@@ -333,9 +514,11 @@ std::vector<SequenceSample> build_sequence_dataset(const ManufacturingDefectData
 ClassificationMetrics evaluate_classification_metrics_lstm(
     LstmNetwork &network,
     const std::vector<SequenceSample> &dataset,
-    float threshold)
+    float threshold,
+    const MlpNetwork::ProgressCallback &progress_callback = {})
 {
     ClassificationMetrics metrics;
+    std::size_t processed = 0;
 
     for (const auto &sample : dataset) {
         const float probability = network.predict_probability(sample);
@@ -350,6 +533,11 @@ ClassificationMetrics evaluate_classification_metrics_lstm(
             ++metrics.tn;
         } else {
             ++metrics.fn;
+        }
+
+        ++processed;
+        if (progress_callback && ((processed % 256 == 0) || (processed == dataset.size()))) {
+            progress_callback(processed, dataset.size(), 0.0f);
         }
     }
 
@@ -443,10 +631,23 @@ TrainingRunResult run_lstm_pipeline(const TrainingConfig &config,
 
     TrainingRunResult result;
     const auto initial_eval_start = std::chrono::high_resolution_clock::now();
-    result.initial_cost = network.evaluate_cost(sequence_dataset, config.loss);
+    result.initial_cost = network.evaluate_cost(
+        sequence_dataset,
+        config.loss,
+        [](std::size_t processed, std::size_t total, float avg_loss) {
+            print_stage_progress_bar("eval", processed, total, avg_loss, "cost");
+        });
+    std::cout << std::endl;
     std::cout << "Initial cost: " << result.initial_cost << std::endl;
     const ClassificationMetrics initial_metrics =
-        evaluate_classification_metrics_lstm(network, sequence_dataset, config.threshold);
+        evaluate_classification_metrics_lstm(
+            network,
+            sequence_dataset,
+            config.threshold,
+            [](std::size_t processed, std::size_t total, float) {
+                print_stage_progress_bar("metrics", processed, total);
+            });
+    std::cout << std::endl;
     const auto initial_eval_end = std::chrono::high_resolution_clock::now();
     const auto initial_eval_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(initial_eval_end - initial_eval_start);
@@ -507,7 +708,11 @@ TrainingRunResult run_lstm_pipeline(const TrainingConfig &config,
                 config.loss,
                 config.batch_size,
                 epoch_timeout,
-                &epoch_timed_out);
+                &epoch_timed_out,
+                [&](std::size_t processed, std::size_t total, float avg_loss) {
+                    print_epoch_progress_bar(epoch, config.epochs, processed, total, avg_loss, current_lr, epoch_start);
+                });
+            std::cout << std::endl;
             const auto epoch_end = std::chrono::high_resolution_clock::now();
             const auto epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(epoch_end - epoch_start);
             accumulated_train_loss += epoch_train_loss;
@@ -516,8 +721,21 @@ TrainingRunResult run_lstm_pipeline(const TrainingConfig &config,
             const bool should_log = (epoch % config.print_every == 0) || (epoch == config.epochs);
             if (should_log) {
                 const auto eval_start = std::chrono::high_resolution_clock::now();
-                result.final_eval_cost = network.evaluate_cost(sequence_dataset, config.loss);
-                result.final_metrics = evaluate_classification_metrics_lstm(network, sequence_dataset, config.threshold);
+                result.final_eval_cost = network.evaluate_cost(
+                    sequence_dataset,
+                    config.loss,
+                    [](std::size_t processed, std::size_t total, float avg_loss) {
+                        print_stage_progress_bar("eval", processed, total, avg_loss, "cost");
+                    });
+                std::cout << std::endl;
+                result.final_metrics = evaluate_classification_metrics_lstm(
+                    network,
+                    sequence_dataset,
+                    config.threshold,
+                    [](std::size_t processed, std::size_t total, float) {
+                        print_stage_progress_bar("metrics", processed, total);
+                    });
+                std::cout << std::endl;
                 const auto eval_end = std::chrono::high_resolution_clock::now();
                 const auto eval_ms = std::chrono::duration_cast<std::chrono::milliseconds>(eval_end - eval_start);
 
@@ -597,7 +815,13 @@ TrainingRunResult run_lstm_pipeline(const TrainingConfig &config,
 
 TrainingRunResult run_training_pipeline(const TrainingConfig &config,
                                         const NetworkBlueprint &blueprint) {
-    const auto dataset = ManufacturingDefectDataset::load_csv(config.dataset_path);
+    std::cout << "Loading dataset..." << std::endl;
+    const auto dataset = ManufacturingDefectDataset::load_csv(
+        config.dataset_path,
+        [](std::size_t processed, std::size_t total) {
+            print_stage_progress_bar("data", processed, total);
+        });
+    std::cout << std::endl;
     std::cout << "Loaded samples: " << dataset.size() << std::endl;
     std::cout << "Feature count: " << dataset.feature_count() << "\n\n";
 
@@ -675,10 +899,23 @@ TrainingRunResult run_training_pipeline(const TrainingConfig &config,
 
     TrainingRunResult result;
     const auto initial_eval_start = std::chrono::high_resolution_clock::now();
-    result.initial_cost = network.evaluate_cost(dataset, config.loss);
+    result.initial_cost = network.evaluate_cost(
+        dataset,
+        config.loss,
+        [](std::size_t processed, std::size_t total, float avg_loss) {
+            print_stage_progress_bar("eval", processed, total, avg_loss, "cost");
+        });
+    std::cout << std::endl;
     std::cout << "Initial cost: " << result.initial_cost << std::endl;
     const ClassificationMetrics initial_metrics =
-        evaluate_classification_metrics(network, dataset, config.threshold);
+        evaluate_classification_metrics(
+            network,
+            dataset,
+            config.threshold,
+            [](std::size_t processed, std::size_t total, float) {
+                print_stage_progress_bar("metrics", processed, total);
+            });
+    std::cout << std::endl;
     const auto initial_eval_end = std::chrono::high_resolution_clock::now();
     const auto initial_eval_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(initial_eval_end - initial_eval_start);
@@ -723,7 +960,11 @@ TrainingRunResult run_training_pipeline(const TrainingConfig &config,
                 dataset,
                 current_lr,
                 config.loss,
-                config.batch_size);
+                config.batch_size,
+                [&](std::size_t processed, std::size_t total, float avg_loss) {
+                    print_epoch_progress_bar(epoch, config.epochs, processed, total, avg_loss, current_lr, epoch_start);
+                });
+            std::cout << std::endl;
             const auto epoch_end = std::chrono::high_resolution_clock::now();
             const auto epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(epoch_end - epoch_start);
             accumulated_train_loss += epoch_train_loss;
@@ -732,8 +973,21 @@ TrainingRunResult run_training_pipeline(const TrainingConfig &config,
             const bool should_log = (epoch % config.print_every == 0) || (epoch == config.epochs);
             if (should_log) {
                 const auto eval_start = std::chrono::high_resolution_clock::now();
-                result.final_eval_cost = network.evaluate_cost(dataset, config.loss);
-                result.final_metrics = evaluate_classification_metrics(network, dataset, config.threshold);
+                result.final_eval_cost = network.evaluate_cost(
+                    dataset,
+                    config.loss,
+                    [](std::size_t processed, std::size_t total, float avg_loss) {
+                        print_stage_progress_bar("eval", processed, total, avg_loss, "cost");
+                    });
+                std::cout << std::endl;
+                result.final_metrics = evaluate_classification_metrics(
+                    network,
+                    dataset,
+                    config.threshold,
+                    [](std::size_t processed, std::size_t total, float) {
+                        print_stage_progress_bar("metrics", processed, total);
+                    });
+                std::cout << std::endl;
                 const auto eval_end = std::chrono::high_resolution_clock::now();
                 const auto eval_ms = std::chrono::duration_cast<std::chrono::milliseconds>(eval_end - eval_start);
 

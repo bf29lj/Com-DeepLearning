@@ -187,6 +187,35 @@ constexpr const char *MATH_KERNEL_SOURCE = R"CLC(
         }
     }
 
+    __kernel void concat_input_hidden(
+        __global const float *input,
+        __global const float *hidden,
+        __global float *z,
+        const uint input_size)
+    {
+        const uint idx = get_global_id(0);
+        if (idx < input_size) {
+            z[idx] = input[idx];
+        } else {
+            z[idx] = hidden[idx - input_size];
+        }
+    }
+
+    __kernel void lstm_cell_update(
+        __global const float *f,
+        __global const float *i,
+        __global const float *g,
+        __global const float *o,
+        __global const float *c_prev,
+        __global float *c_out,
+        __global float *h_out)
+    {
+        const uint idx = get_global_id(0);
+        const float c_val = f[idx] * c_prev[idx] + i[idx] * g[idx];
+        c_out[idx] = c_val;
+        h_out[idx] = o[idx] * tanh(c_val);
+    }
+
     __kernel void dense_accumulate_grads(
         __global float *grad_weights,
         __global float *grad_biases,

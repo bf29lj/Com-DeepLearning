@@ -682,40 +682,58 @@ void MlpNetwork::backward_update_cpu(const ForwardCache &cache,
     }
 }
 
-float MlpNetwork::evaluate_cost_cpu(const ManufacturingDefectDataset &dataset, LossType loss_type) const {
+float MlpNetwork::evaluate_cost_cpu(const ManufacturingDefectDataset &dataset,
+                                    LossType loss_type,
+                                    const ProgressCallback &progress_callback) const {
     if (dataset.size() == 0) {
         throw std::invalid_argument("Dataset is empty");
     }
 
     float total_loss = 0.0f;
+    std::size_t processed = 0;
     for (const auto &sample : dataset.samples()) {
         const std::vector<float> prediction = forward_cpu(sample.features);
         const float y_hat = prediction.empty() ? 0.0f : prediction[0];
         const float y = static_cast<float>(sample.label);
         total_loss += compute_loss(y_hat, y, loss_type, positive_class_weight_, negative_class_weight_, focal_gamma_, focal_alpha_);
+        ++processed;
+        if (progress_callback && ((processed % 256 == 0) || (processed == dataset.size()))) {
+            const float avg_loss = total_loss / static_cast<float>(processed);
+            progress_callback(processed, dataset.size(), avg_loss);
+        }
     }
 
     return total_loss / static_cast<float>(dataset.size());
 }
 
-float MlpNetwork::evaluate_cost(const ManufacturingDefectDataset &dataset, LossType loss_type) const {
+float MlpNetwork::evaluate_cost(const ManufacturingDefectDataset &dataset,
+                                LossType loss_type,
+                                const ProgressCallback &progress_callback) const {
     if (execution_backend_ == ExecutionBackend::GPU) {
-        return evaluate_cost_gpu(dataset, loss_type);
+        return evaluate_cost_gpu(dataset, loss_type, progress_callback);
     }
-    return evaluate_cost_cpu(dataset, loss_type);
+    return evaluate_cost_cpu(dataset, loss_type, progress_callback);
 }
 
-float MlpNetwork::evaluate_cost_gpu(const ManufacturingDefectDataset &dataset, LossType loss_type) const {
+float MlpNetwork::evaluate_cost_gpu(const ManufacturingDefectDataset &dataset,
+                                    LossType loss_type,
+                                    const ProgressCallback &progress_callback) const {
     if (dataset.size() == 0) {
         throw std::invalid_argument("Dataset is empty");
     }
 
     float total_loss = 0.0f;
+    std::size_t processed = 0;
     for (const auto &sample : dataset.samples()) {
         const std::vector<float> prediction = forward_gpu(sample.features);
         const float y_hat = prediction.empty() ? 0.0f : prediction[0];
         const float y = static_cast<float>(sample.label);
         total_loss += compute_loss(y_hat, y, loss_type, positive_class_weight_, negative_class_weight_, focal_gamma_, focal_alpha_);
+        ++processed;
+        if (progress_callback && ((processed % 256 == 0) || (processed == dataset.size()))) {
+            const float avg_loss = total_loss / static_cast<float>(processed);
+            progress_callback(processed, dataset.size(), avg_loss);
+        }
     }
 
     return total_loss / static_cast<float>(dataset.size());
@@ -724,7 +742,8 @@ float MlpNetwork::evaluate_cost_gpu(const ManufacturingDefectDataset &dataset, L
 float MlpNetwork::train_one_epoch_internal(const ManufacturingDefectDataset &dataset,
                                            float learning_rate,
                                            LossType loss_type,
-                                           std::size_t batch_size)
+                                           std::size_t batch_size,
+                                           const ProgressCallback &progress_callback)
 {
     if (dataset.size() == 0) {
         throw std::invalid_argument("Dataset is empty");
@@ -843,6 +862,7 @@ float MlpNetwork::train_one_epoch_internal(const ManufacturingDefectDataset &dat
     std::iota(sample_indices.begin(), sample_indices.end(), 0);
     static std::mt19937 rng(42u);
     std::shuffle(sample_indices.begin(), sample_indices.end(), rng);
+    std::size_t processed_samples = 0;
 
     for (std::size_t begin = 0; begin < sample_indices.size(); begin += batch_size) {
         const std::size_t end = std::min(begin + batch_size, sample_indices.size());
@@ -861,6 +881,7 @@ float MlpNetwork::train_one_epoch_internal(const ManufacturingDefectDataset &dat
             total_loss += compute_loss(current[0], target, loss_type, positive_class_weight_, negative_class_weight_, focal_gamma_, focal_alpha_);
             accumulate_sample_gradients(cache, target);
         }
+        processed_samples += current_batch_size;
 
         const float inv_batch = 1.0f / static_cast<float>(current_batch_size);
         const std::uint64_t next_step = optimizer_step_ + 1;
@@ -920,6 +941,13 @@ float MlpNetwork::train_one_epoch_internal(const ManufacturingDefectDataset &dat
         }
         optimizer_step_ = next_step;
 
+        if (progress_callback) {
+            const float avg_loss = processed_samples == 0
+                ? 0.0f
+                : total_loss / static_cast<float>(processed_samples);
+            progress_callback(processed_samples, dataset.size(), avg_loss);
+        }
+
     }
 
     invalidate_gpu_parameter_cache();
@@ -929,9 +957,10 @@ float MlpNetwork::train_one_epoch_internal(const ManufacturingDefectDataset &dat
 float MlpNetwork::train_one_epoch_cpu(const ManufacturingDefectDataset &dataset,
                                       float learning_rate,
                                       LossType loss_type,
-                                      std::size_t batch_size)
+                                      std::size_t batch_size,
+                                      const ProgressCallback &progress_callback)
 {
-    return train_one_epoch_internal(dataset, learning_rate, loss_type, batch_size);
+    return train_one_epoch_internal(dataset, learning_rate, loss_type, batch_size, progress_callback);
 }
 
 void MlpNetwork::backward_update_gpu(const ForwardCache &cache,
@@ -1068,7 +1097,8 @@ void MlpNetwork::backward_update_gpu(const ForwardCache &cache,
 float MlpNetwork::train_one_epoch_internal_gpu(const ManufacturingDefectDataset &dataset,
                                                float learning_rate,
                                                LossType loss_type,
-                                               std::size_t batch_size)
+                                               std::size_t batch_size,
+                                               const ProgressCallback &progress_callback)
 {
     if (dataset.size() == 0) {
         throw std::invalid_argument("Dataset is empty");
@@ -1090,6 +1120,7 @@ float MlpNetwork::train_one_epoch_internal_gpu(const ManufacturingDefectDataset 
     std::iota(sample_indices.begin(), sample_indices.end(), 0);
     static std::mt19937 rng(42u);
     std::shuffle(sample_indices.begin(), sample_indices.end(), rng);
+    std::size_t processed_samples = 0;
 
     if (gpu_runtime_->layer_states.size() != layers_.size() || !gpu_runtime_->parameters_synced) {
         const DefectSample &warmup_sample = dataset.sample(sample_indices.front());
@@ -1197,8 +1228,16 @@ float MlpNetwork::train_one_epoch_internal_gpu(const ManufacturingDefectDataset 
             total_loss += compute_loss(current[0], target, loss_type, positive_class_weight_, negative_class_weight_, focal_gamma_, focal_alpha_);
             backward_update_gpu(cache, target, learning_rate, loss_type);
         }
+        processed_samples += current_batch_size;
 
         apply_optimizer_update(current_batch_size);
+
+        if (progress_callback) {
+            const float avg_loss = processed_samples == 0
+                ? 0.0f
+                : total_loss / static_cast<float>(processed_samples);
+            progress_callback(processed_samples, dataset.size(), avg_loss);
+        }
     }
 
     gpu_runtime_->context.get_queue().finish();
@@ -1210,20 +1249,22 @@ float MlpNetwork::train_one_epoch_internal_gpu(const ManufacturingDefectDataset 
 float MlpNetwork::train_one_epoch_gpu(const ManufacturingDefectDataset &dataset,
                                       float learning_rate,
                                       LossType loss_type,
-                                      std::size_t batch_size)
+                                      std::size_t batch_size,
+                                      const ProgressCallback &progress_callback)
 {
-    return train_one_epoch_internal_gpu(dataset, learning_rate, loss_type, batch_size);
+    return train_one_epoch_internal_gpu(dataset, learning_rate, loss_type, batch_size, progress_callback);
 }
 
 float MlpNetwork::train_one_epoch(const ManufacturingDefectDataset &dataset,
                                   float learning_rate,
                                   LossType loss_type,
-                                  std::size_t batch_size)
+                                  std::size_t batch_size,
+                                  const ProgressCallback &progress_callback)
 {
     if (execution_backend_ == ExecutionBackend::GPU) {
-        return train_one_epoch_gpu(dataset, learning_rate, loss_type, batch_size);
+        return train_one_epoch_gpu(dataset, learning_rate, loss_type, batch_size, progress_callback);
     }
-    return train_one_epoch_cpu(dataset, learning_rate, loss_type, batch_size);
+    return train_one_epoch_cpu(dataset, learning_rate, loss_type, batch_size, progress_callback);
 }
 
 void MlpNetwork::save_to_file(const std::filesystem::path &model_path) const {
