@@ -168,6 +168,14 @@ constexpr const char *MATH_KERNEL_SOURCE = R"CLC(
         values[idx] *= factors[idx];
     }
 
+    __kernel void elementwise_add_inplace(
+        __global float *values,
+        __global const float *addends)
+    {
+        const uint idx = get_global_id(0);
+        values[idx] += addends[idx];
+    }
+
     __kernel void fill_float(
         __global float *values,
         const float value,

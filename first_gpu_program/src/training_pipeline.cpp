@@ -122,7 +122,13 @@ NetworkBlueprint make_default_mlp_blueprint(ActivationType hidden_activation,
 namespace {
 
 const char *loss_name(LossType loss) {
-    return loss == LossType::BCE ? "BCE" : "MSE";
+    if (loss == LossType::BCE) {
+        return "BCE";
+    }
+    if (loss == LossType::MSE) {
+        return "MSE";
+    }
+    return "Focal";
 }
 
 const char *model_name(const std::string &model_type) {
@@ -154,7 +160,7 @@ void compute_auto_class_weights(const ManufacturingDefectDataset &dataset,
     if (positives == 0 || negatives == 0) {
         throw std::runtime_error("Auto class weights require both classes in the dataset");
     }
-    std::cout << "Dataset class distribution: positives=" << positives << ", negatives=" << negatives << "\n";
+    std::cout << "Dataset class distribution: positives=" << positives << ", negatives=" << negatives << std::endl;
     const std::uint64_t total = positives + negatives;
     positive_weight = static_cast<float>(total) / (2.0f * static_cast<float>(positives));
     negative_weight = static_cast<float>(total) / (2.0f * static_cast<float>(negatives));
@@ -247,14 +253,14 @@ void print_classification_metrics(const ClassificationMetrics &metrics) {
     std::cout << "Confusion matrix: TP=" << metrics.tp
               << ", FP=" << metrics.fp
               << ", TN=" << metrics.tn
-              << ", FN=" << metrics.fn << "\n";
+              << ", FN=" << metrics.fn << std::endl;
 
     std::cout << std::fixed << std::setprecision(6)
               << "Accuracy=" << metrics.accuracy
               << ", Precision=" << metrics.precision
               << ", Recall=" << metrics.recall
               << ", Specificity=" << metrics.specificity
-              << ", F1=" << metrics.f1 << "\n";
+              << ", F1=" << metrics.f1 << std::endl;
     std::cout.unsetf(std::ios::floatfield);
 }
 
@@ -375,22 +381,24 @@ TrainingRunResult run_lstm_pipeline(const TrainingConfig &config,
                                     const ManufacturingDefectDataset &dataset)
 {
     const auto sequence_dataset = build_sequence_dataset(dataset, config.lstm_seq_len);
-    std::cout << "Model: " << model_name(config.model_type) << "\n";
-    std::cout << "Sequence length: " << config.lstm_seq_len << "\n";
-    std::cout << "LSTM hidden size: " << config.lstm_hidden_size << "\n";
+    std::cout << "Model: " << model_name(config.model_type) << std::endl;
+    std::cout << "Sequence length: " << config.lstm_seq_len << std::endl;
+    std::cout << "LSTM hidden size: " << config.lstm_hidden_size << std::endl;
     std::cout << "Sequence samples: " << sequence_dataset.size() << "\n\n";
 
     LstmNetwork network(dataset.feature_count(), config.lstm_hidden_size);
+    network.set_execution_backend(config.backend);
     network.set_optimizer_type(config.optimizer);
     network.set_optimizer_hyperparameters(
         config.momentum,
         config.adam_beta1,
         config.adam_beta2,
         config.adam_epsilon);
+    network.set_focal_parameters(config.focal_gamma, config.focal_alpha);
 
     if (!config.load_model_path.empty()) {
         network.load_from_file(config.load_model_path);
-        std::cout << "Loaded model: " << config.load_model_path.string() << "\n";
+        std::cout << "Loaded model: " << config.load_model_path.string() << std::endl;
     }
 
     float positive_weight = config.positive_class_weight;
@@ -401,50 +409,66 @@ TrainingRunResult run_lstm_pipeline(const TrainingConfig &config,
     network.set_class_weights(positive_weight, negative_weight);
 
     std::cout << "Using BCE class weights: pos=" << positive_weight
-              << ", neg=" << negative_weight << "\n";
-    std::cout << "Loss function: " << loss_name(config.loss) << "\n";
-    std::cout << "Optimizer: " << optimizer_name(config.optimizer) << "\n";
+              << ", neg=" << negative_weight << std::endl;
+    std::cout << "Loss function: " << loss_name(config.loss) << std::endl;
+    std::cout << "Optimizer: " << optimizer_name(config.optimizer) << std::endl;
     if (config.optimizer == OptimizerType::Momentum) {
-        std::cout << "Momentum: " << config.momentum << "\n";
+        std::cout << "Momentum: " << config.momentum << std::endl;
     } else if (config.optimizer == OptimizerType::Adam) {
         std::cout << "Adam betas: beta1=" << config.adam_beta1
                   << ", beta2=" << config.adam_beta2
-                  << ", epsilon=" << config.adam_epsilon << "\n";
+                  << ", epsilon=" << config.adam_epsilon << std::endl;
     }
-    std::cout << "Execution backend: " << backend_name(config.backend) << "\n";
-    std::cout << "Learning rate: " << config.learning_rate << "\n";
+    std::cout << "Execution backend: " << backend_name(config.backend) << std::endl;
+    std::cout << "Learning rate: " << config.learning_rate << std::endl;
     std::cout << "LR decay: " << config.lr_decay
               << " every " << config.lr_decay_every
-              << " epoch(s), min_lr=" << config.min_learning_rate << "\n";
-    std::cout << "Auto class weights: " << (config.auto_class_weights ? "true" : "false") << "\n";
-    std::cout << "Threshold: " << config.threshold << "\n";
-    std::cout << "Batch size: " << config.batch_size << "\n";
-    std::cout << "Epochs: " << config.epochs << "\n";
-    std::cout << "Print every: " << config.print_every << "\n";
-    std::cout << "Eval only: " << (config.eval_only ? "true" : "false") << "\n";
+              << " epoch(s), min_lr=" << config.min_learning_rate << std::endl;
+    std::cout << "Auto class weights: " << (config.auto_class_weights ? "true" : "false") << std::endl;
+    std::cout << "Threshold: " << config.threshold << std::endl;
+    std::cout << "Batch size: " << config.batch_size << std::endl;
+    std::cout << "Epochs: " << config.epochs << std::endl;
+    std::cout << "Print every: " << config.print_every << std::endl;
+    std::cout << "Eval only: " << (config.eval_only ? "true" : "false") << std::endl;
+    std::cout << "Timeout sec: " << config.timeout_sec << std::endl;
     std::cout << "Dataset path: " << config.dataset_path.string() << "\n\n";
 
     TrainingRunResult result;
+    const auto initial_eval_start = std::chrono::high_resolution_clock::now();
     result.initial_cost = network.evaluate_cost(sequence_dataset, config.loss);
-    std::cout << "Initial cost: " << result.initial_cost << "\n";
+    std::cout << "Initial cost: " << result.initial_cost << std::endl;
     const ClassificationMetrics initial_metrics =
         evaluate_classification_metrics_lstm(network, sequence_dataset, config.threshold);
+    const auto initial_eval_end = std::chrono::high_resolution_clock::now();
+    const auto initial_eval_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(initial_eval_end - initial_eval_start);
     print_classification_metrics(initial_metrics);
 
     std::unique_ptr<ResultsCsvWriter> csv_writer;
     if (!config.results_csv_path.empty()) {
         csv_writer = std::make_unique<ResultsCsvWriter>(config.results_csv_path);
-        csv_writer->write_row("initial", 0, 0.0f, result.initial_cost, initial_metrics, 0);
-        std::cout << "Results CSV: " << config.results_csv_path.string() << "\n";
+        csv_writer->write_row("initial", 0, 0.0f, result.initial_cost, initial_metrics, initial_eval_ms.count());
+        std::cout << "Results CSV: " << config.results_csv_path.string() << std::endl;
     }
 
     result.final_eval_cost = result.initial_cost;
     result.final_metrics = initial_metrics;
     float accumulated_train_loss = 0.0f;
+    std::size_t completed_epochs = 0;
     const auto training_start = std::chrono::high_resolution_clock::now();
 
     if (!config.eval_only) {
         for (std::size_t epoch = 1; epoch <= config.epochs; ++epoch) {
+            if (config.timeout_sec > 0.0f) {
+                const auto now = std::chrono::high_resolution_clock::now();
+                const float elapsed_sec =
+                    std::chrono::duration_cast<std::chrono::duration<float>>(now - training_start).count();
+                if (elapsed_sec >= config.timeout_sec) {
+                    std::cout << "Timeout reached before epoch " << epoch
+                              << " (limit=" << config.timeout_sec << " sec). Stopping early.\n";
+                    break;
+                }
+            }
             const auto epoch_start = std::chrono::high_resolution_clock::now();
             const std::size_t decay_steps = (epoch - 1) / config.lr_decay_every;
             float current_lr = config.learning_rate;
@@ -455,14 +479,31 @@ TrainingRunResult run_lstm_pipeline(const TrainingConfig &config,
                 current_lr = config.min_learning_rate;
             }
 
+            float epoch_timeout = 0.0f;
+            if (config.timeout_sec > 0.0f) {
+                const auto now = std::chrono::high_resolution_clock::now();
+                const float elapsed_sec =
+                    std::chrono::duration_cast<std::chrono::duration<float>>(now - training_start).count();
+                epoch_timeout = std::max(0.0f, config.timeout_sec - elapsed_sec);
+                if (epoch_timeout <= 0.0f) {
+                    std::cout << "Timeout reached before epoch " << epoch
+                              << " (limit=" << config.timeout_sec << " sec). Stopping early.\n";
+                    break;
+                }
+            }
+
+            bool epoch_timed_out = false;
             const float epoch_train_loss = network.train_one_epoch(
                 sequence_dataset,
                 current_lr,
                 config.loss,
-                config.batch_size);
+                config.batch_size,
+                epoch_timeout,
+                &epoch_timed_out);
             const auto epoch_end = std::chrono::high_resolution_clock::now();
             const auto epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(epoch_end - epoch_start);
             accumulated_train_loss += epoch_train_loss;
+            ++completed_epochs;
 
             const bool should_log = (epoch % config.print_every == 0) || (epoch == config.epochs);
             if (should_log) {
@@ -483,13 +524,20 @@ TrainingRunResult run_lstm_pipeline(const TrainingConfig &config,
                     csv_writer->write_row("epoch", epoch, epoch_train_loss, result.final_eval_cost, result.final_metrics, eval_ms.count());
                 }
             }
+
+            if (config.timeout_sec > 0.0f) {
+                const auto now = std::chrono::high_resolution_clock::now();
+                const float elapsed_sec =
+                    std::chrono::duration_cast<std::chrono::duration<float>>(now - training_start).count();
+                if (epoch_timed_out || elapsed_sec >= config.timeout_sec) {
+                    std::cout << "Timeout reached after epoch " << epoch
+                              << " (limit=" << config.timeout_sec << " sec). Stopping early.\n";
+                    break;
+                }
+            }
         }
     } else {
-        const auto eval_start = std::chrono::high_resolution_clock::now();
-        result.final_eval_cost = network.evaluate_cost(sequence_dataset, config.loss);
-        result.final_metrics = evaluate_classification_metrics_lstm(network, sequence_dataset, config.threshold);
-        const auto eval_end = std::chrono::high_resolution_clock::now();
-        const auto eval_ms = std::chrono::duration_cast<std::chrono::milliseconds>(eval_end - eval_start);
+        const auto eval_ms = initial_eval_ms;
         std::cout << "Eval-only cost: " << result.final_eval_cost
                   << ", eval_time=" << eval_ms.count() << " ms\n";
         print_classification_metrics(result.final_metrics);
@@ -504,18 +552,18 @@ TrainingRunResult run_lstm_pipeline(const TrainingConfig &config,
 
     result.average_epoch_train_loss = config.eval_only
         ? 0.0f
-        : accumulated_train_loss / static_cast<float>(config.epochs);
+        : (completed_epochs == 0 ? 0.0f : accumulated_train_loss / static_cast<float>(completed_epochs));
 
     if (!config.save_model_path.empty()) {
         network.save_to_file(config.save_model_path);
-        std::cout << "Saved model: " << config.save_model_path.string() << "\n";
+        std::cout << "Saved model: " << config.save_model_path.string() << std::endl;
     }
 
     std::cout << "\nTraining summary:\n";
     if (!config.eval_only) {
-        std::cout << "Average epoch train loss: " << result.average_epoch_train_loss << "\n";
+        std::cout << "Average epoch train loss: " << result.average_epoch_train_loss << std::endl;
     }
-    std::cout << "Final eval cost: " << result.final_eval_cost << "\n";
+    std::cout << "Final eval cost: " << result.final_eval_cost << std::endl;
     std::cout << "Total training time: " << result.total_training_ms << " ms\n";
 
     if (!config.pr_csv_path.empty()) {
@@ -542,14 +590,14 @@ TrainingRunResult run_lstm_pipeline(const TrainingConfig &config,
 TrainingRunResult run_training_pipeline(const TrainingConfig &config,
                                         const NetworkBlueprint &blueprint) {
     const auto dataset = ManufacturingDefectDataset::load_csv(config.dataset_path);
-    std::cout << "Loaded samples: " << dataset.size() << "\n";
+    std::cout << "Loaded samples: " << dataset.size() << std::endl;
     std::cout << "Feature count: " << dataset.feature_count() << "\n\n";
 
     if (config.model_type == "lstm") {
         return run_lstm_pipeline(config, dataset);
     }
 
-    std::cout << "Model: " << model_name(config.model_type) << "\n";
+    std::cout << "Model: " << model_name(config.model_type) << std::endl;
 
     std::vector<OperationConfig> operations;
     if (!config.load_model_path.empty()) {
@@ -571,10 +619,11 @@ TrainingRunResult run_training_pipeline(const TrainingConfig &config,
         config.adam_beta1,
         config.adam_beta2,
         config.adam_epsilon);
+    network.set_focal_parameters(config.focal_gamma, config.focal_alpha);
 
     if (!config.load_model_path.empty()) {
         network.load_from_file(config.load_model_path);
-        std::cout << "Loaded model: " << config.load_model_path.string() << "\n";
+        std::cout << "Loaded model: " << config.load_model_path.string() << std::endl;
     }
 
     float positive_weight = config.positive_class_weight;
@@ -584,52 +633,68 @@ TrainingRunResult run_training_pipeline(const TrainingConfig &config,
     }
     network.set_class_weights(positive_weight, negative_weight);
     std::cout << "Using BCE class weights: pos=" << positive_weight
-              << ", neg=" << negative_weight << "\n";
-    std::cout << "Loss function: " << loss_name(config.loss) << "\n";
-    std::cout << "Optimizer: " << optimizer_name(config.optimizer) << "\n";
+              << ", neg=" << negative_weight << std::endl;
+    std::cout << "Loss function: " << loss_name(config.loss) << std::endl;
+    std::cout << "Optimizer: " << optimizer_name(config.optimizer) << std::endl;
     if (config.optimizer == OptimizerType::Momentum) {
-        std::cout << "Momentum: " << config.momentum << "\n";
+        std::cout << "Momentum: " << config.momentum << std::endl;
     } else if (config.optimizer == OptimizerType::Adam) {
         std::cout << "Adam betas: beta1=" << config.adam_beta1
                   << ", beta2=" << config.adam_beta2
-                  << ", epsilon=" << config.adam_epsilon << "\n";
+                  << ", epsilon=" << config.adam_epsilon << std::endl;
     }
-    std::cout << "Execution backend: " << backend_name(config.backend) << "\n";
-    std::cout << "Hidden activation: " << activation_name(config.hidden_activation) << "\n";
-    std::cout << "Output activation: " << activation_name(config.output_activation) << "\n";
-    std::cout << "Learning rate: " << config.learning_rate << "\n";
+    std::cout << "Execution backend: " << backend_name(config.backend) << std::endl;
+    std::cout << "Hidden activation: " << activation_name(config.hidden_activation) << std::endl;
+    std::cout << "Output activation: " << activation_name(config.output_activation) << std::endl;
+    std::cout << "Learning rate: " << config.learning_rate << std::endl;
     std::cout << "LR decay: " << config.lr_decay
               << " every " << config.lr_decay_every
-              << " epoch(s), min_lr=" << config.min_learning_rate << "\n";
-    std::cout << "Auto class weights: " << (config.auto_class_weights ? "true" : "false") << "\n";
-    std::cout << "Threshold: " << config.threshold << "\n";
-    std::cout << "Batch size: " << config.batch_size << "\n";
-    std::cout << "Epochs: " << config.epochs << "\n";
-    std::cout << "Print every: " << config.print_every << "\n";
-    std::cout << "Eval only: " << (config.eval_only ? "true" : "false") << "\n";
+              << " epoch(s), min_lr=" << config.min_learning_rate << std::endl;
+    std::cout << "Auto class weights: " << (config.auto_class_weights ? "true" : "false") << std::endl;
+    std::cout << "Threshold: " << config.threshold << std::endl;
+    std::cout << "Batch size: " << config.batch_size << std::endl;
+    std::cout << "Epochs: " << config.epochs << std::endl;
+    std::cout << "Print every: " << config.print_every << std::endl;
+    std::cout << "Eval only: " << (config.eval_only ? "true" : "false") << std::endl;
+    std::cout << "Timeout sec: " << config.timeout_sec << std::endl;
     std::cout << "Dataset path: " << config.dataset_path.string() << "\n\n";
 
     TrainingRunResult result;
+    const auto initial_eval_start = std::chrono::high_resolution_clock::now();
     result.initial_cost = network.evaluate_cost(dataset, config.loss);
-    std::cout << "Initial cost: " << result.initial_cost << "\n";
+    std::cout << "Initial cost: " << result.initial_cost << std::endl;
     const ClassificationMetrics initial_metrics =
         evaluate_classification_metrics(network, dataset, config.threshold);
+    const auto initial_eval_end = std::chrono::high_resolution_clock::now();
+    const auto initial_eval_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(initial_eval_end - initial_eval_start);
     print_classification_metrics(initial_metrics);
 
     std::unique_ptr<ResultsCsvWriter> csv_writer;
     if (!config.results_csv_path.empty()) {
         csv_writer = std::make_unique<ResultsCsvWriter>(config.results_csv_path);
-        csv_writer->write_row("initial", 0, 0.0f, result.initial_cost, initial_metrics, 0);
-        std::cout << "Results CSV: " << config.results_csv_path.string() << "\n";
+        csv_writer->write_row("initial", 0, 0.0f, result.initial_cost, initial_metrics, initial_eval_ms.count());
+        std::cout << "Results CSV: " << config.results_csv_path.string() << std::endl;
     }
 
     result.final_eval_cost = result.initial_cost;
     result.final_metrics = initial_metrics;
     float accumulated_train_loss = 0.0f;
+    std::size_t completed_epochs = 0;
     const auto training_start = std::chrono::high_resolution_clock::now();
 
     if (!config.eval_only) {
         for (std::size_t epoch = 1; epoch <= config.epochs; ++epoch) {
+            if (config.timeout_sec > 0.0f) {
+                const auto now = std::chrono::high_resolution_clock::now();
+                const float elapsed_sec =
+                    std::chrono::duration_cast<std::chrono::duration<float>>(now - training_start).count();
+                if (elapsed_sec >= config.timeout_sec) {
+                    std::cout << "Timeout reached before epoch " << epoch
+                              << " (limit=" << config.timeout_sec << " sec). Stopping early.\n";
+                    break;
+                }
+            }
             const auto epoch_start = std::chrono::high_resolution_clock::now();
             const std::size_t decay_steps = (epoch - 1) / config.lr_decay_every;
             float current_lr = config.learning_rate;
@@ -648,6 +713,7 @@ TrainingRunResult run_training_pipeline(const TrainingConfig &config,
             const auto epoch_end = std::chrono::high_resolution_clock::now();
             const auto epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(epoch_end - epoch_start);
             accumulated_train_loss += epoch_train_loss;
+            ++completed_epochs;
 
             const bool should_log = (epoch % config.print_every == 0) || (epoch == config.epochs);
             if (should_log) {
@@ -668,13 +734,20 @@ TrainingRunResult run_training_pipeline(const TrainingConfig &config,
                     csv_writer->write_row("epoch", epoch, epoch_train_loss, result.final_eval_cost, result.final_metrics, eval_ms.count());
                 }
             }
+
+            if (config.timeout_sec > 0.0f) {
+                const auto now = std::chrono::high_resolution_clock::now();
+                const float elapsed_sec =
+                    std::chrono::duration_cast<std::chrono::duration<float>>(now - training_start).count();
+                if (elapsed_sec >= config.timeout_sec) {
+                    std::cout << "Timeout reached after epoch " << epoch
+                              << " (limit=" << config.timeout_sec << " sec). Stopping early.\n";
+                    break;
+                }
+            }
         }
     } else {
-        const auto eval_start = std::chrono::high_resolution_clock::now();
-        result.final_eval_cost = network.evaluate_cost(dataset, config.loss);
-        result.final_metrics = evaluate_classification_metrics(network, dataset, config.threshold);
-        const auto eval_end = std::chrono::high_resolution_clock::now();
-        const auto eval_ms = std::chrono::duration_cast<std::chrono::milliseconds>(eval_end - eval_start);
+        const auto eval_ms = initial_eval_ms;
         std::cout << "Eval-only cost: " << result.final_eval_cost
                   << ", eval_time=" << eval_ms.count() << " ms\n";
         print_classification_metrics(result.final_metrics);
@@ -689,18 +762,18 @@ TrainingRunResult run_training_pipeline(const TrainingConfig &config,
 
     result.average_epoch_train_loss = config.eval_only
         ? 0.0f
-        : accumulated_train_loss / static_cast<float>(config.epochs);
+        : (completed_epochs == 0 ? 0.0f : accumulated_train_loss / static_cast<float>(completed_epochs));
 
     if (!config.save_model_path.empty()) {
         network.save_to_file(config.save_model_path);
-        std::cout << "Saved model: " << config.save_model_path.string() << "\n";
+        std::cout << "Saved model: " << config.save_model_path.string() << std::endl;
     }
 
     std::cout << "\nTraining summary:\n";
     if (!config.eval_only) {
-        std::cout << "Average epoch train loss: " << result.average_epoch_train_loss << "\n";
+        std::cout << "Average epoch train loss: " << result.average_epoch_train_loss << std::endl;
     }
-    std::cout << "Final eval cost: " << result.final_eval_cost << "\n";
+    std::cout << "Final eval cost: " << result.final_eval_cost << std::endl;
     std::cout << "Total training time: " << result.total_training_ms << " ms\n";
 
     if (!config.pr_csv_path.empty()) {

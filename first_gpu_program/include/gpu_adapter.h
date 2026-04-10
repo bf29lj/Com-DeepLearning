@@ -118,6 +118,7 @@ public:
 
     // Copy to host
     void copy_to_host(void *host_ptr, size_t bytes);
+    void copy_to_host_offset(void *host_ptr, size_t bytes, size_t offset_bytes);
 
     template <typename T>
     std::vector<T> to_host() {

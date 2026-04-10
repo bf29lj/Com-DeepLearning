@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <vector>
 
 struct SequenceSample {
@@ -19,10 +20,15 @@ struct SequenceSample {
 class LstmNetwork {
 public:
     LstmNetwork(std::size_t input_size, std::size_t hidden_size);
+    ~LstmNetwork();
+
+    void set_execution_backend(ExecutionBackend backend) { execution_backend_ = backend; }
+    ExecutionBackend execution_backend() const { return execution_backend_; }
 
     void set_optimizer_type(OptimizerType optimizer_type) { optimizer_type_ = optimizer_type; }
     void set_optimizer_hyperparameters(float momentum, float adam_beta1, float adam_beta2, float adam_epsilon);
     void set_class_weights(float positive_weight, float negative_weight);
+    void set_focal_parameters(float gamma, float alpha);
     void save_to_file(const std::filesystem::path &path) const;
     void load_from_file(const std::filesystem::path &path);
 
@@ -32,7 +38,9 @@ public:
     float train_one_epoch(const std::vector<SequenceSample> &dataset,
                           float learning_rate,
                           LossType loss_type,
-                          std::size_t batch_size);
+                          std::size_t batch_size,
+                          float timeout_sec = 0.0f,
+                          bool *timed_out = nullptr);
 
 private:
     struct StepCache {
@@ -71,8 +79,12 @@ private:
         float dby = 0.0f;
     };
 
-    ForwardCache forward_with_cache(const std::vector<std::vector<float>> &sequence) const;
+    ForwardCache forward_with_cache_cpu(const std::vector<std::vector<float>> &sequence) const;
+    ForwardCache forward_with_cache_cpu(const SequenceSample &sample) const;
+    ForwardCache forward_with_cache_gpu(const SequenceSample &sample) const;
     ForwardCache forward_with_cache(const SequenceSample &sample) const;
+    void ensure_gpu_runtime() const;
+    void invalidate_gpu_parameter_cache();
     float compute_loss(float prediction, float target, LossType loss_type) const;
     float output_logit_gradient(float prediction, float target, LossType loss_type) const;
     void clear_gradients(Gradients &grads) const;
@@ -126,4 +138,10 @@ private:
 
     float positive_class_weight_ = 1.0f;
     float negative_class_weight_ = 1.0f;
+    float focal_gamma_ = 2.0f;
+    float focal_alpha_ = 0.25f;
+
+    struct GpuRuntimeImpl;
+    mutable std::unique_ptr<GpuRuntimeImpl> gpu_runtime_;
+    ExecutionBackend execution_backend_ = ExecutionBackend::CPU;
 };

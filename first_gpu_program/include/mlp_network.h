@@ -21,6 +21,7 @@ enum class ActivationType {
 enum class LossType {
     BCE,
     MSE,
+    Focal,
 };
 
 enum class ExecutionBackend {
@@ -105,6 +106,7 @@ public:
     void set_enable_bce_sigmoid_shortcut(bool enable) { enable_bce_sigmoid_shortcut_ = enable; }
     bool enable_bce_sigmoid_shortcut() const { return enable_bce_sigmoid_shortcut_; }
     void set_class_weights(float positive_weight, float negative_weight);
+    void set_focal_parameters(float gamma, float alpha);
     float positive_class_weight() const { return positive_class_weight_; }
     float negative_class_weight() const { return negative_class_weight_; }
 
@@ -179,7 +181,9 @@ private:
                                      bool use_bce_sigmoid_shortcut,
                                      float positive_weight,
                                      float negative_weight,
-                                     float (*loss_derivative_wrt_prediction)(float, float, LossType, float, float));
+                                     float focal_gamma,
+                                     float focal_alpha,
+                                     float (*loss_derivative_wrt_prediction)(float, float, LossType, float, float, float, float));
         static void update_dense_layer(DenseLayer &layer,
                                        const std::vector<float> &input,
                                        const std::vector<float> &grad_output,
@@ -215,12 +219,16 @@ private:
                               float target,
                               LossType loss_type,
                               float positive_weight,
-                              float negative_weight);
+                              float negative_weight,
+                              float focal_gamma,
+                              float focal_alpha);
     static float loss_derivative_wrt_prediction(float prediction,
                                                 float target,
                                                 LossType loss_type,
                                                 float positive_weight,
-                                                float negative_weight);
+                                                float negative_weight,
+                                                float focal_gamma,
+                                                float focal_alpha);
     static float activation_derivative(OperationType op_type, float pre_activation, float post_activation);
     bool should_use_bce_sigmoid_shortcut(LossType loss_type) const;
     static ActivationType operation_to_activation(OperationType op_type);
@@ -240,4 +248,6 @@ private:
     bool enable_bce_sigmoid_shortcut_ = true;
     float positive_class_weight_ = 1.0f;
     float negative_class_weight_ = 1.0f;
+    float focal_gamma_ = 2.0f;
+    float focal_alpha_ = 0.25f;
 };

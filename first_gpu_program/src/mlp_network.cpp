@@ -73,12 +73,21 @@ float MlpNetwork::SgdOptimizer::output_gradient(
     bool use_bce_sigmoid_shortcut,
     float positive_weight,
     float negative_weight,
-    float (*loss_derivative_wrt_prediction_fn)(float, float, LossType, float, float))
+    float focal_gamma,
+    float focal_alpha,
+    float (*loss_derivative_wrt_prediction_fn)(float, float, LossType, float, float, float, float))
 {
     if (use_bce_sigmoid_shortcut) {
         return positive_weight * target * (prediction - 1.0f) + negative_weight * (1.0f - target) * prediction;
     }
-    return loss_derivative_wrt_prediction_fn(prediction, target, loss_type, positive_weight, negative_weight);
+    return loss_derivative_wrt_prediction_fn(
+        prediction,
+        target,
+        loss_type,
+        positive_weight,
+        negative_weight,
+        focal_gamma,
+        focal_alpha);
 }
 
 void MlpNetwork::set_optimizer_hyperparameters(float momentum,
@@ -214,6 +223,17 @@ void MlpNetwork::set_class_weights(float positive_weight, float negative_weight)
     }
     positive_class_weight_ = positive_weight;
     negative_class_weight_ = negative_weight;
+}
+
+void MlpNetwork::set_focal_parameters(float gamma, float alpha) {
+    if (gamma < 0.0f || !std::isfinite(gamma)) {
+        throw std::invalid_argument("Focal gamma must be non-negative and finite");
+    }
+    if (alpha < 0.0f || alpha > 1.0f || !std::isfinite(alpha)) {
+        throw std::invalid_argument("Focal alpha must be within [0, 1]");
+    }
+    focal_gamma_ = gamma;
+    focal_alpha_ = alpha;
 }
 
 MlpNetwork::ForwardCache MlpNetwork::forward_with_cache_cpu(const std::vector<float> &input) const {
@@ -472,7 +492,9 @@ float MlpNetwork::compute_loss(float prediction,
                                float target,
                                LossType loss_type,
                                float positive_weight,
-                               float negative_weight) {
+                               float negative_weight,
+                               float focal_gamma,
+                               float focal_alpha) {
     if (loss_type == LossType::MSE) {
         const float diff = prediction - target;
         return diff * diff;
@@ -480,6 +502,14 @@ float MlpNetwork::compute_loss(float prediction,
 
     const float epsilon = 1e-7f;
     const float p = std::clamp(prediction, epsilon, 1.0f - epsilon);
+    if (loss_type == LossType::Focal) {
+        if (target >= 0.5f) {
+            const float modulating = std::pow(1.0f - p, focal_gamma);
+            return -(positive_weight * focal_alpha) * modulating * std::log(p);
+        }
+        const float modulating = std::pow(p, focal_gamma);
+        return -(negative_weight * (1.0f - focal_alpha)) * modulating * std::log(1.0f - p);
+    }
     return -(positive_weight * target * std::log(p) +
              negative_weight * (1.0f - target) * std::log(1.0f - p));
 }
@@ -488,13 +518,29 @@ float MlpNetwork::loss_derivative_wrt_prediction(float prediction,
                                                  float target,
                                                  LossType loss_type,
                                                  float positive_weight,
-                                                 float negative_weight) {
+                                                 float negative_weight,
+                                                 float focal_gamma,
+                                                 float focal_alpha) {
     if (loss_type == LossType::MSE) {
         return 2.0f * (prediction - target);
     }
 
     const float epsilon = 1e-7f;
     const float p = std::clamp(prediction, epsilon, 1.0f - epsilon);
+    if (loss_type == LossType::Focal) {
+        if (target >= 0.5f) {
+            const float one_minus_p = 1.0f - p;
+            const float modulating = std::pow(one_minus_p, focal_gamma);
+            const float modulating_grad =
+                focal_gamma * std::pow(one_minus_p, focal_gamma - 1.0f);
+            const float positive_scale = positive_weight * focal_alpha;
+            return positive_scale * (modulating_grad * std::log(p) - modulating / p);
+        }
+        const float modulating = std::pow(p, focal_gamma);
+        const float modulating_grad = focal_gamma * std::pow(p, focal_gamma - 1.0f);
+        const float negative_scale = negative_weight * (1.0f - focal_alpha);
+        return negative_scale * (modulating / (1.0f - p) - modulating_grad * std::log(1.0f - p));
+    }
     return -(positive_weight * target / p) + (negative_weight * (1.0f - target) / (1.0f - p));
 }
 
@@ -577,6 +623,8 @@ void MlpNetwork::backward_update_cpu(const ForwardCache &cache,
         use_bce_sigmoid_shortcut,
         positive_class_weight_,
         negative_class_weight_,
+        focal_gamma_,
+        focal_alpha_,
         loss_derivative_wrt_prediction);
 
     std::size_t reverse_linear_index = layers_.size();
@@ -637,7 +685,7 @@ float MlpNetwork::evaluate_cost_cpu(const ManufacturingDefectDataset &dataset, L
         const std::vector<float> prediction = forward_cpu(sample.features);
         const float y_hat = prediction.empty() ? 0.0f : prediction[0];
         const float y = static_cast<float>(sample.label);
-        total_loss += compute_loss(y_hat, y, loss_type, positive_class_weight_, negative_class_weight_);
+        total_loss += compute_loss(y_hat, y, loss_type, positive_class_weight_, negative_class_weight_, focal_gamma_, focal_alpha_);
     }
 
     return total_loss / static_cast<float>(dataset.size());
@@ -660,7 +708,7 @@ float MlpNetwork::evaluate_cost_gpu(const ManufacturingDefectDataset &dataset, L
         const std::vector<float> prediction = forward_gpu(sample.features);
         const float y_hat = prediction.empty() ? 0.0f : prediction[0];
         const float y = static_cast<float>(sample.label);
-        total_loss += compute_loss(y_hat, y, loss_type, positive_class_weight_, negative_class_weight_);
+        total_loss += compute_loss(y_hat, y, loss_type, positive_class_weight_, negative_class_weight_, focal_gamma_, focal_alpha_);
     }
 
     return total_loss / static_cast<float>(dataset.size());
@@ -723,6 +771,8 @@ float MlpNetwork::train_one_epoch_internal(const ManufacturingDefectDataset &dat
             use_bce_sigmoid_shortcut,
             positive_class_weight_,
             negative_class_weight_,
+            focal_gamma_,
+            focal_alpha_,
             loss_derivative_wrt_prediction);
 
         std::size_t reverse_linear_index = layers_.size();
@@ -801,7 +851,7 @@ float MlpNetwork::train_one_epoch_internal(const ManufacturingDefectDataset &dat
                 throw std::runtime_error("Network output is empty");
             }
 
-            total_loss += compute_loss(current[0], target, loss_type, positive_class_weight_, negative_class_weight_);
+            total_loss += compute_loss(current[0], target, loss_type, positive_class_weight_, negative_class_weight_, focal_gamma_, focal_alpha_);
             accumulate_sample_gradients(cache, target);
         }
 
@@ -888,6 +938,8 @@ void MlpNetwork::backward_update_gpu(const ForwardCache &cache,
         use_bce_sigmoid_shortcut,
         positive_class_weight_,
         negative_class_weight_,
+        focal_gamma_,
+        focal_alpha_,
         loss_derivative_wrt_prediction);
 
     std::size_t reverse_linear_index = layers_.size();
@@ -1120,7 +1172,7 @@ float MlpNetwork::train_one_epoch_internal_gpu(const ManufacturingDefectDataset 
             }
 
             const float target = static_cast<float>(sample.label);
-            total_loss += compute_loss(current[0], target, loss_type, positive_class_weight_, negative_class_weight_);
+            total_loss += compute_loss(current[0], target, loss_type, positive_class_weight_, negative_class_weight_, focal_gamma_, focal_alpha_);
             backward_update_gpu(cache, target, learning_rate, loss_type);
         }
 

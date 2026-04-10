@@ -193,6 +193,8 @@ void load_training_config_file(const std::filesystem::path &path, TrainingConfig
             config.loss = LossType::BCE;
         } else if (loss == "mse") {
             config.loss = LossType::MSE;
+        } else if (loss == "focal") {
+            config.loss = LossType::Focal;
         } else {
             throw std::runtime_error(parse_error_with_context(path, "Invalid loss: " + loss));
         }
@@ -215,6 +217,14 @@ void load_training_config_file(const std::filesystem::path &path, TrainingConfig
     if (!lr.empty()) {
         config.learning_rate = std::stof(lr);
     }
+    const std::string focal_gamma = get_or_empty(sections, "runtime", "focal_gamma");
+    if (!focal_gamma.empty()) {
+        config.focal_gamma = std::stof(focal_gamma);
+    }
+    const std::string focal_alpha = get_or_empty(sections, "runtime", "focal_alpha");
+    if (!focal_alpha.empty()) {
+        config.focal_alpha = std::stof(focal_alpha);
+    }
     const std::string lr_decay = get_or_empty(sections, "runtime", "lr_decay");
     if (!lr_decay.empty()) {
         config.lr_decay = std::stof(lr_decay);
@@ -227,6 +237,10 @@ void load_training_config_file(const std::filesystem::path &path, TrainingConfig
     if (!min_learning_rate.empty()) {
         config.min_learning_rate = std::stof(min_learning_rate);
     }
+        const std::string timeout_sec = get_or_empty(sections, "runtime", "timeout_sec");
+        if (!timeout_sec.empty()) {
+            config.timeout_sec = std::stof(timeout_sec);
+        }
     const std::string momentum = get_or_empty(sections, "runtime", "momentum");
     if (!momentum.empty()) {
         config.momentum = std::stof(momentum);
@@ -353,7 +367,13 @@ void save_training_config_file(const std::filesystem::path &path, const Training
 
     out << "[runtime]\n";
     out << "backend=" << (config.backend == ExecutionBackend::GPU ? "gpu" : "cpu") << "\n";
-    out << "loss=" << (config.loss == LossType::BCE ? "bce" : "mse") << "\n";
+    const char *loss = "bce";
+    if (config.loss == LossType::MSE) {
+        loss = "mse";
+    } else if (config.loss == LossType::Focal) {
+        loss = "focal";
+    }
+    out << "loss=" << loss << "\n";
     const char *optimizer = "sgd";
     if (config.optimizer == OptimizerType::Momentum) {
         optimizer = "momentum";
@@ -362,6 +382,8 @@ void save_training_config_file(const std::filesystem::path &path, const Training
     }
     out << "optimizer=" << optimizer << "\n";
     out << "learning_rate=" << config.learning_rate << "\n";
+    out << "focal_gamma=" << config.focal_gamma << "\n";
+    out << "focal_alpha=" << config.focal_alpha << "\n";
     out << "momentum=" << config.momentum << "\n";
     out << "adam_beta1=" << config.adam_beta1 << "\n";
     out << "adam_beta2=" << config.adam_beta2 << "\n";
@@ -369,6 +391,7 @@ void save_training_config_file(const std::filesystem::path &path, const Training
     out << "lr_decay=" << config.lr_decay << "\n";
     out << "lr_decay_every=" << config.lr_decay_every << "\n";
     out << "min_learning_rate=" << config.min_learning_rate << "\n";
+        out << "timeout_sec=" << config.timeout_sec << "\n";
     const char *hidden_activation = "relu";
     if (config.hidden_activation == ActivationType::Sigmoid) {
         hidden_activation = "sigmoid";

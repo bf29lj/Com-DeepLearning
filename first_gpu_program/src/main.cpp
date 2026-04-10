@@ -29,11 +29,14 @@ void print_usage() {
               << "  --output-act <linear|sigmoid|tanh|relu|leaky_relu|gelu> Output activation (default: sigmoid)\n"
               << "  --results-csv <path> Write per-epoch metrics to CSV\n"
               << "  --pr-csv <path>      Write threshold scan for PR curve to CSV\n"
-              << "  --loss <bce|mse>     Loss function (default: bce)\n"
+              << "  --loss <bce|mse|focal> Loss function (default: bce)\n"
+              << "  --focal-gamma <float> Focal loss gamma (default: 2.0)\n"
+              << "  --focal-alpha <float> Focal loss alpha in [0,1] (default: 0.25)\n"
               << "  --lr <float>         Learning rate (default: 0.01)\n"
               << "  --lr-decay <float>   Multiplicative LR decay factor (default: 1.0)\n"
               << "  --lr-decay-every <int> Apply LR decay every N epochs (default: 1)\n"
               << "  --min-lr <float>     Lower bound for decayed LR (default: 0.0)\n"
+              << "  --timeout-sec <float> Stop training after this many seconds (0=disabled)\n"
               << "  --pos-weight <float> Positive class weight for BCE (default: 1.0)\n"
               << "  --neg-weight <float> Negative class weight for BCE (default: 1.0)\n"
               << "  --auto-class-weights Auto-compute BCE class weights from dataset\n"
@@ -71,7 +74,10 @@ LossType parse_loss(const std::string &value) {
     if (value == "mse") {
         return LossType::MSE;
     }
-    throw std::invalid_argument("Invalid loss: " + value + ". Use bce or mse.");
+    if (value == "focal") {
+        return LossType::Focal;
+    }
+    throw std::invalid_argument("Invalid loss: " + value + ". Use bce, mse or focal.");
 }
 
 OptimizerType parse_optimizer(const std::string &value) {
@@ -183,6 +189,10 @@ TrainingConfig parse_args(int argc, char **argv) {
             cfg.output_activation = parse_activation(need_value(arg));
         } else if (arg == "--loss") {
             cfg.loss = parse_loss(need_value(arg));
+        } else if (arg == "--focal-gamma") {
+            cfg.focal_gamma = std::stof(need_value(arg));
+        } else if (arg == "--focal-alpha") {
+            cfg.focal_alpha = std::stof(need_value(arg));
         } else if (arg == "--lr") {
             cfg.learning_rate = std::stof(need_value(arg));
         } else if (arg == "--lr-decay") {
@@ -195,6 +205,8 @@ TrainingConfig parse_args(int argc, char **argv) {
             cfg.lr_decay_every = static_cast<std::size_t>(decay_every);
         } else if (arg == "--min-lr") {
             cfg.min_learning_rate = std::stof(need_value(arg));
+        } else if (arg == "--timeout-sec") {
+            cfg.timeout_sec = std::stof(need_value(arg));
         } else if (arg == "--pr-csv") {
             cfg.pr_csv_path = need_value(arg);
         } else if (arg == "--pos-weight") {
@@ -260,12 +272,11 @@ TrainingConfig parse_args(int argc, char **argv) {
         throw std::invalid_argument("Hidden activation cannot be linear");
     }
 
-    if (cfg.backend == ExecutionBackend::GPU && cfg.model_type == "lstm") {
-        throw std::invalid_argument("LSTM GPU backend is still under development. Please use --backend cpu for --model lstm.");
-    }
-
     if (cfg.learning_rate <= 0.0f || !std::isfinite(cfg.learning_rate)) {
         throw std::invalid_argument("--lr must be a positive finite number");
+    }
+    if (cfg.timeout_sec < 0.0f || !std::isfinite(cfg.timeout_sec)) {
+        throw std::invalid_argument("--timeout-sec must be a non-negative finite number");
     }
     if (cfg.momentum < 0.0f || cfg.momentum >= 1.0f || !std::isfinite(cfg.momentum)) {
         throw std::invalid_argument("--momentum must be in [0, 1)");
@@ -293,6 +304,12 @@ TrainingConfig parse_args(int argc, char **argv) {
     }
     if (cfg.negative_class_weight <= 0.0f || !std::isfinite(cfg.negative_class_weight)) {
         throw std::invalid_argument("--neg-weight must be a positive finite number");
+    }
+    if (cfg.focal_gamma < 0.0f || !std::isfinite(cfg.focal_gamma)) {
+        throw std::invalid_argument("--focal-gamma must be a non-negative finite number");
+    }
+    if (cfg.focal_alpha < 0.0f || cfg.focal_alpha > 1.0f || !std::isfinite(cfg.focal_alpha)) {
+        throw std::invalid_argument("--focal-alpha must be within [0, 1]");
     }
     if (cfg.threshold < 0.0f || cfg.threshold > 1.0f || !std::isfinite(cfg.threshold)) {
         throw std::invalid_argument("--threshold must be within [0, 1]");

@@ -50,10 +50,13 @@ struct TrainingConfig {
     float lr_decay = 1.0f;
     std::size_t lr_decay_every = 1;
     float min_learning_rate = 0.0f;
+    float timeout_sec = 0.0f;
     std::filesystem::path results_csv_path;
     std::filesystem::path pr_csv_path;
     float positive_class_weight = 1.0f;
     float negative_class_weight = 1.0f;
+    float focal_gamma = 2.0f;
+    float focal_alpha = 0.25f;
     float threshold = 0.5f;
     float pr_scan_min = 0.0f;
     float pr_scan_max = 1.0f;

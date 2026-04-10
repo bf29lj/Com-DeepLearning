@@ -105,3 +105,17 @@ void GpuBuffer::copy_from_host(const void *host_ptr, size_t bytes) {
         throw GpuException(std::string("Failed to copy buffer from host: ") + e.what());
     }
 }
+
+void GpuBuffer::copy_to_host_offset(void *host_ptr, size_t bytes, size_t offset_bytes) {
+    if (offset_bytes + bytes > element_count_) {
+        throw GpuException("Copy range exceeds buffer capacity");
+    }
+    try {
+        compute::copy(vec_->begin() + static_cast<std::ptrdiff_t>(offset_bytes),
+                      vec_->begin() + static_cast<std::ptrdiff_t>(offset_bytes + bytes),
+                      static_cast<uint8_t *>(host_ptr), context_->get_queue());
+        context_->get_queue().finish();
+    } catch (const std::exception &e) {
+        throw GpuException(std::string("Failed to copy buffer range to host: ") + e.what());
+    }
+}
