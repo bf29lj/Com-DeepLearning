@@ -9,3 +9,6 @@ datasets/
 *.log
 .clangd
 compile_commands.json
+.venv/
+__pycache__/
+.venv-dml/
